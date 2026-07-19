@@ -1,0 +1,5 @@
+node_modules/
+.codex/workflow-runs/
+.codex/worktrees/
+flux/.local
+flux/changes
