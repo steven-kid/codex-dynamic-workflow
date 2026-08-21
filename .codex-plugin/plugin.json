@@ -1,0 +1,28 @@
+{
+  "name": "codex-dynamic-workflow",
+  "version": "0.1.0",
+  "description": "Dynamic Workflow for Codex: orchestrate many codex subagents from a deterministic JS script (fan-out, pipelines, adversarial verification, token budgets, resume).",
+  "author": {
+    "name": "wangyuchao.404"
+  },
+  "license": "MIT",
+  "keywords": [
+    "workflow",
+    "orchestration",
+    "multi-agent",
+    "subagents",
+    "pipeline"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Dynamic Workflow",
+    "shortDescription": "用确定性脚本编排多个 codex 子 agent",
+    "category": "Development",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "brandColor": "#10A37F"
+  }
+}

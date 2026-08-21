@@ -1,0 +1,17 @@
+{
+  "name": "codex-dynamic-workflow",
+  "interface": {
+    "displayName": "Codex Dynamic Workflow"
+  },
+  "plugins": [
+    {
+      "name": "codex-dynamic-workflow",
+      "source": "./",
+      "category": "dev-tools",
+      "policy": {
+        "installation": "AVAILABLE",
+        "products": ["codex"]
+      }
+    }
+  ]
+}

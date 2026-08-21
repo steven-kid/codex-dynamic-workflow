@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "dynamic-workflow": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/bin/cdw.js",
+        "mcp"
+      ],
+      "env": {}
+    }
+  }
+}
