@@ -27,7 +27,7 @@ const USAGE = `cdw —— Codex Dynamic Workflow
 
 选项:
   --args <json>          传给脚本的 args（JSON 字面量或 @文件路径）
-  --budget <n>           output token 预算上限，超出后 agent() 抛错
+  --budget <n>           output token 派发阈值，超出后 agent() 抛错
   --concurrency <n>      并发 agent 上限，默认 min(16, cpu-2)
   --model <model>        默认模型，可被 agent opts.model 覆盖
   --effort <level>       默认推理档位: minimal|low|medium|high|xhigh

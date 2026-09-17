@@ -21,7 +21,6 @@ import {
   DEFAULT_SCHEMA_RETRIES,
   EFFORT_LEVELS,
   MAX_AGENTS_PER_RUN,
-  MAX_ITEMS_PER_CALL,
   MAX_WORKFLOW_DEPTH,
   SANDBOX_MODES,
   defaultConcurrency,
@@ -108,6 +107,7 @@ class RunContext {
     this.agentSeq = 0;
     this.agentCount = 0;
     this.depth = 0;
+    this.pendingAgents = new Set();
     this.worktrees = [];
     /** worktreeKey → createWorktree 的 promise，供多阶段复用同一份 worktree */
     this.worktreesByKey = new Map();
@@ -122,7 +122,7 @@ class RunContext {
     return Math.max(0, this.budgetTotal - this.spentOutputTokens);
   }
 
-  assertRunnable() {
+  assertRunnable({ checkLimit = true } = {}) {
     if (this.signal?.aborted) throw new WorkflowAbortError('run 已中止');
     if (this.budgetTotal !== null && this.spentOutputTokens >= this.budgetTotal) {
       throw new BudgetExhaustedError(
@@ -130,7 +130,7 @@ class RunContext {
         { total: this.budgetTotal, spent: this.spentOutputTokens },
       );
     }
-    if (this.agentCount >= MAX_AGENTS_PER_RUN) {
+    if (checkLimit && this.agentCount >= MAX_AGENTS_PER_RUN) {
       throw new WorkflowLimitError(`单次 run 的 agent 总数已达上限 ${MAX_AGENTS_PER_RUN}`);
     }
   }
@@ -170,14 +170,14 @@ export async function runWorkflow(options) {
   const runId = makeRunId();
   const dir = path.join(transcriptRoot ?? path.join(cwd, '.codex', 'workflows'), runId);
   const journal = new Journal(dir);
-  await journal.init();
-
   if (resumeFromRunId || resumeDir) {
     const priorDir =
       resumeDir ?? path.join(transcriptRoot ?? path.join(cwd, '.codex', 'workflows'), resumeFromRunId);
     const { loaded } = await journal.loadPrior(priorDir);
     onEvent({ type: 'run.resume', runId, from: resumeFromRunId ?? priorDir, cachedCalls: loaded });
   }
+
+  await journal.init();
 
   // 脚本原文落盘：用户改脚本后可用 scriptPath + resumeFromRunId 续跑
   await fsp.writeFile(path.join(dir, 'workflow.js'), source.text, 'utf8');
@@ -194,6 +194,11 @@ export async function runWorkflow(options) {
     onEvent(enriched);
   };
 
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) abort();
+  signal?.addEventListener('abort', abort, { once: true });
+
   const ctx = new RunContext({
     ...rest,
     runId,
@@ -201,7 +206,7 @@ export async function runWorkflow(options) {
     registry,
     journal,
     semaphore: new Semaphore(concurrency),
-    signal,
+    signal: controller.signal,
     emit,
     transcriptDir: dir,
     budgetTotal: budget,
@@ -226,10 +231,19 @@ export async function runWorkflow(options) {
   let error = null;
 
   try {
-    result = await run(...buildHooks(ctx, { args, meta }));
+    result = await run(buildHooks(ctx, { args, meta }));
   } catch (err) {
     status = err instanceof BudgetExhaustedError ? 'budget_exhausted' : 'failed';
     error = err;
+  } finally {
+    // Drain started/queued agents before closing journals or removing worktrees.
+    controller.abort();
+    await Promise.allSettled([...ctx.pendingAgents]);
+    signal?.removeEventListener('abort', abort);
+  }
+  if (status === 'ok' && budget !== null && ctx.spentOutputTokens > budget) {
+    status = 'budget_exhausted';
+    error = new BudgetExhaustedError('token 预算已用尽（已运行请求可能超额）', { total: budget, spent: ctx.spentOutputTokens });
   }
 
   // 清理无改动的 worktree（元素是 createWorktree 的 promise，可能尚未 settle）
@@ -267,7 +281,7 @@ export async function runWorkflow(options) {
   return summary;
 }
 
-/** 组装注入给脚本的钩子，顺序必须与 script.js 里的 hookNames 一致 */
+/** 宿主钩子由 JSON bridge 调用；parallel/pipeline 在脚本上下文中执行。 */
 function buildHooks(ctx, { args, meta }) {
   let currentPhase = null;
 
@@ -275,54 +289,10 @@ function buildHooks(ctx, { args, meta }) {
     if (typeof prompt !== 'string' || !prompt.trim()) {
       throw new WorkflowScriptError('agent(prompt) 的 prompt 必须是非空字符串');
     }
-    return runAgent(ctx, prompt, { ...opts, phase: opts.phase ?? currentPhase });
-  };
-
-  const parallel = async (thunks) => {
-    if (!Array.isArray(thunks)) throw new WorkflowScriptError('parallel(thunks) 需要一个数组');
-    assertItemCount(thunks.length, 'parallel');
-    // 屏障语义：等齐所有分支；单分支失败降级为 null，不让整体 reject
-    return Promise.all(
-      thunks.map(async (thunk, i) => {
-        if (typeof thunk !== 'function') {
-          throw new WorkflowScriptError(`parallel(thunks)[${i}] 必须是返回 Promise 的函数`);
-        }
-        try {
-          return await thunk();
-        } catch (err) {
-          if (isFatal(err)) throw err;
-          ctx.emit({ type: 'branch.failed', index: i, message: err.message });
-          return null;
-        }
-      }),
-    );
-  };
-
-  const pipeline = async (items, ...stages) => {
-    if (!Array.isArray(items)) throw new WorkflowScriptError('pipeline(items, ...) 需要一个数组');
-    assertItemCount(items.length, 'pipeline');
-    if (stages.length === 0) return items.slice();
-    for (const [i, stage] of stages.entries()) {
-      if (typeof stage !== 'function') {
-        throw new WorkflowScriptError(`pipeline 的第 ${i + 1} 个 stage 必须是函数`);
-      }
-    }
-    // 无屏障：每个 item 独立跑完所有 stage，item A 可以在 stage3 时 item B 还在 stage1
-    return Promise.all(
-      items.map(async (item, index) => {
-        let value = item;
-        for (const stage of stages) {
-          try {
-            value = await stage(value, item, index);
-          } catch (err) {
-            if (isFatal(err)) throw err;
-            ctx.emit({ type: 'item.dropped', index, message: err.message });
-            return null;
-          }
-        }
-        return value;
-      }),
-    );
+    const pending = runAgent(ctx, prompt, { ...opts, phase: opts.phase ?? currentPhase });
+    ctx.pendingAgents.add(pending);
+    try { return await pending; }
+    finally { ctx.pendingAgents.delete(pending); }
   };
 
   const phase = (title) => {
@@ -354,7 +324,7 @@ function buildHooks(ctx, { args, meta }) {
     return ctx.resolveWorkflow(nameOrRef, childArgs);
   };
 
-  return [agent, parallel, pipeline, phase, log, args, budget, workflow, meta];
+  return { agent, phase, log, args, budget, workflow, meta, reportFailure: event => ctx.emit(event) };
 }
 
 /** 这些错误不该被 parallel/pipeline 吞掉，必须终止整个 run */
@@ -365,14 +335,6 @@ function isFatal(err) {
     err instanceof WorkflowLimitError ||
     err instanceof WorkflowScriptError
   );
-}
-
-function assertItemCount(count, who) {
-  if (count > MAX_ITEMS_PER_CALL) {
-    throw new WorkflowLimitError(
-      `单次 ${who}() 最多接受 ${MAX_ITEMS_PER_CALL} 个条目，实际 ${count}；请自行分批`,
-    );
-  }
 }
 
 /** 派发一个子 agent：并发槽 → 缓存 → worktree → codex exec → schema 校验 → 记账 */
@@ -413,13 +375,19 @@ async function runAgent(ctx, prompt, opts) {
     agentSystemPrompt: agentDef.systemPrompt || null,
     isolation: opts.isolation ?? null,
     worktreeKey: opts.worktreeKey ?? null,
-    cwd: opts.cwd ?? null,
+    cwd: path.resolve(opts.cwd ?? ctx.cwd),
+    dryRun: ctx.dryRun,
+    fullAuto: ctx.fullAuto,
   };
-  const fp = fingerprint(prompt, resolved);
+  const fp = fingerprint(buildAgentPrompt({ prompt, ...resolved }), resolved);
 
   // resume：命中最长未变前缀则直接返回历史结果
+  // Isolated writes cannot be replayed from text alone: rerun until worktree
+  // state is explicitly persisted/restored as part of the resume contract.
+  if (resolved.isolation === 'worktree') ctx.journal.breakPrefix();
   const cached = ctx.journal.lookup(seq, fp);
   if (cached) {
+    ctx.journal.append({ ...cached, seq, label, cached: true, usage: emptyUsage() });
     ctx.emit({ type: 'agent.cached', seq, label, phase: resolved.phase });
     return cached.result;
   }
@@ -437,7 +405,7 @@ async function runAgent(ctx, prompt, opts) {
         // 同一个 worktreeKey 的多个 agent 复用同一份 worktree，
         // 这样「改造 → 验证」这类多阶段流程里，后一阶段能看到前一阶段的实际改动。
         // 存 promise 而非结果，避免并发同 key 时重复创建。
-        const key = opts.worktreeKey ?? agentId;
+        const key = opts.worktreeKey ? `${ctx.runId}-${opts.worktreeKey}` : agentId;
         let pending = ctx.worktreesByKey.get(key);
         if (!pending) {
           pending = createWorktree({ repoRoot: workDir, name: key });
@@ -474,7 +442,7 @@ async function runAgent(ctx, prompt, opts) {
 
     while (attempt < maxAttempts) {
       attempt += 1;
-      ctx.assertRunnable();
+      ctx.assertRunnable({ checkLimit: false });
 
       try {
         const composed = buildAgentPrompt({
@@ -625,7 +593,7 @@ async function runChildWorkflow({ ctx, nameOrRef, childArgs, workflowDirs, cwd }
   });
   const { meta, run } = compileScript(source.text, { filename: source.filename });
 
-  ctx.depth += 1;
+  const childDepth = ctx.depth + 1;
   ctx.emit({ type: 'workflow.child.started', name: meta.name });
   try {
     // 用 Proxy 而不是 Object.create：后者会让子 workflow 的 `ctx.agentCount += 1`
@@ -633,14 +601,14 @@ async function runChildWorkflow({ ctx, nameOrRef, childArgs, workflowDirs, cwd }
     // Proxy 把所有读写都转发到同一个 ctx，只替换 emit。
     const childEmit = (event) => ctx.emit({ ...event, childWorkflow: meta.name });
     const childCtx = new Proxy(ctx, {
-      get: (target, prop) => (prop === 'emit' ? childEmit : Reflect.get(target, prop, target)),
+      get: (target, prop) => prop === 'depth' ? childDepth : (prop === 'emit' ? childEmit : Reflect.get(target, prop, target)),
       set: (target, prop, value) => Reflect.set(target, prop, value, target),
     });
-    const result = await run(...buildHooks(childCtx, { args: childArgs, meta }));
+    const result = await run(buildHooks(childCtx, { args: childArgs, meta }));
     ctx.emit({ type: 'workflow.child.finished', name: meta.name });
     return result;
   } finally {
-    ctx.depth -= 1;
+    // Depth belongs to the child invocation, not the shared run.
   }
 }
 

@@ -36,6 +36,8 @@ description: 用确定性 JS 脚本编排多个 codex 子 agent —— fan-out �
 （哪些文件、哪些模块、diff 范围），拿到清单后再用 `workflow_run` 对清单做流水线。
 你不需要在动手前就知道全貌，只需要在**下达编排指令前**知道。
 
+使用本插件的 `dynamic-workflow` MCP server（单数），不要与其他同名或近似插件混用。调用 `workflow_run` 必须传入目标项目的绝对路径 `cwd`；MCP server 自身的目录是插件安装目录。列出项目自定义 workflow 时，`workflow_list` 也传入同一 `cwd`。
+
 写完脚本先调 `workflow_validate`（不花钱），通过后再 `workflow_run`。
 
 ## 脚本骨架
@@ -142,8 +144,10 @@ return { confirmed: results.flat().filter(Boolean).filter((f) => f.verdict?.real
 ## 断点续跑
 
 每次 run 都会把脚本存档并返回 `runId` 与 `transcriptDir`。改完脚本后用
-`workflow_run({ scriptPath, resumeFromRunId })` 续跑：**未变更的调用前缀**直接复用缓存，
+`workflow_run({ cwd, scriptPath, resumeFromRunId })` 续跑：**未变更的调用前缀**直接复用缓存，
 从第一个改动过的调用开始重跑。
 
 排查「为什么结果是空的」时，先用 `workflow_inspect` 看 journal 里每个 agent 的真实返回值，
 不要凭空猜测。
+
+预算是停止派发阈值，已运行请求可能超额；模拟运行不复用到真实运行，worktree 调用从该位置开始重跑。

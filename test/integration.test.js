@@ -191,7 +191,7 @@ return await agent('结构化任务', {
   assert.equal(completed.attempts, 2, '应该在第二次尝试才成功');
 });
 
-test('budget.remaining() 归零后循环自然收口，run 正常结束', async () => {
+test('预算循环超额时如实标记 budget_exhausted', async () => {
   const { summary } = await run(
     `export const meta = {
   name: 'budget-loop',
@@ -206,13 +206,13 @@ return { calls: out.length, remaining: budget.remaining() }
     { runOptions: { budget: 120 } },
   );
   // 每个 agent 50 output tokens：跑 3 次后 spent=150，remaining 归零，循环退出
-  assert.equal(summary.status, 'ok');
+  assert.equal(summary.status, 'budget_exhausted');
   assert.equal(summary.agentCount, 3);
-  assert.equal(summary.result.calls, 3);
-  assert.equal(summary.result.remaining, 0);
+  assert.equal(summary.usage.outputTokens, 150);
+  assert.equal(summary.result, null);
 });
 
-test('预算是硬上限：用尽后再调 agent() 抛错，run 记为 budget_exhausted', async () => {
+test('预算派发阈值：用尽后再调 agent() 抛错，run 记为 budget_exhausted', async () => {
   const { summary } = await run(
     `export const meta = {
   name: 'budget-hard',
@@ -652,4 +652,58 @@ return await agent('任务')
   // 脚本原文应被存档，供 resume 使用
   const archived = await fsp.readFile(path.join(summary.transcriptDir, 'workflow.js'), 'utf8');
   assert.match(archived, /name: 'summary'/);
+});
+
+test('连续恢复保留缓存，dry-run 不污染真实结果', async () => {
+  const dir = await fsp.mkdtemp(path.join(workDir, 'resume-chain-'));
+  const codexBin = await makeCodexShim(dir);
+  const base = { script: 'export const meta = {name:"chain",description:"test"}; return await agent("task");', cwd: dir, codexBin };
+  const first = await runWorkflow(base);
+  const second = await runWorkflow({ ...base, resumeFromRunId: first.runId });
+  const third = await runWorkflow({ ...base, resumeFromRunId: second.runId });
+  assert.deepEqual([first.agentCount, second.agentCount, third.agentCount], [1, 0, 0]);
+  const dry = await runWorkflow({ ...base, dryRun: true });
+  const real = await runWorkflow({ ...base, resumeFromRunId: dry.runId });
+  assert.equal(real.agentCount, 1);
+  assert.equal(real.result, 'echo:task');
+});
+
+test('并发请求超额不能返回 ok，尚未派发的请求停止', async () => {
+  const { summary } = await run('export const meta = {name:"overshoot",description:"test"}; return await parallel(Array.from({length:6},()=>()=>agent("task")));', {
+    concurrency: 2, fakeEnv: { CDW_FAKE_DELAY_MS: 100 }, runOptions: { budget: 1 },
+  });
+  assert.equal(summary.status, 'budget_exhausted');
+  assert.ok(summary.agentCount <= 2);
+  assert.ok(summary.usage.outputTokens >= 50);
+});
+
+test('宿主对象、钩子、错误和返回值不能泄露宿主 Function', async () => {
+  const { summary } = await run(`export const meta = {name:'escape-check',description:'test'};
+    const attacks = [
+      () => process,
+      () => agent.constructor('return process')(),
+      () => args.constructor.constructor('return process')(),
+      () => budget.spent.constructor('return process')(),
+      () => globalThis.Math.random(),
+      () => globalThis.Date.now(),
+      () => new (Object.getPrototypeOf(Date))(),
+    ];
+    const blocked = [];
+    for (const attack of attacks) { try { attack(); blocked.push(false); } catch { blocked.push(true); } }
+    const result = await agent('data', {schema:{type:'object',properties:{title:{type:'string'}}}});
+    try { result.constructor.constructor('return process')(); blocked.push(false); } catch { blocked.push(true); }
+    try { await agent('x',{agentType:'missing'}); } catch(e) {
+      try { e.constructor.constructor('return process')(); blocked.push(false); } catch { blocked.push(true); }
+    }
+    return blocked;
+  `, { runOptions: { args: {} } });
+  assert.equal(summary.result.length, 9);
+  assert.ok(summary.result.every(Boolean));
+});
+
+test('不存在的 codex 二进制立即失败并清理超时句柄', async () => {
+  const { summary } = await run('export const meta={name:"missing-bin",description:"test"};return await parallel([()=>agent("task")]);', {
+    runOptions: { codexBin: '/nonexistent/cdw-test-codex', maxRetries: 0 },
+  });
+  assert.deepEqual(summary.result, [null]);
 });

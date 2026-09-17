@@ -118,7 +118,7 @@ const results = await pipeline(
 
 ### `parallel(thunks)` —— 屏障
 
-并发执行并**等齐所有结果**。单个 thunk 失败解析为 `null`，调用本身永不 reject。
+并发执行并**等齐所有结果**。普通分支失败解析为 `null`；取消、预算耗尽、脚本错误和运行上限会终止整个 run。
 
 ```js
 const votes = await parallel([
@@ -172,7 +172,7 @@ budget.spent()      // 本次 run 已消耗的 output tokens
 budget.remaining()  // max(0, total - spent)；未设预算时为 Infinity
 ```
 
-预算是**硬上限**：用尽后再调 `agent()` 会直接抛错，run 以 `budget_exhausted` 结束。
+预算是**停止派发的阈值，不是计费硬上限**：用尽后再调 `agent()` 会直接抛错；已经运行的请求可能超额。结束时超出预算的 run 也会标记为 `budget_exhausted`。预算只统计 output tokens，不代表总费用。
 
 ```js
 // 按预算动态决定深度。注意必须 guard budget.total —— 
@@ -369,12 +369,14 @@ node bin/cdw.js run ./wf.js --resume wf_abc123
 
 **语义是「最长未变前缀」**：从头开始逐个比对每次 `agent()` 调用的指纹（prompt + 影响执行的 opts），一路命中缓存直到遇到第一个改动过的调用，从那里开始全部重跑。
 
-- 脚本完全没改 → 100% 命中，瞬间返回
+- 脚本完全没改 → 可复用的调用命中缓存
 - 改了中间某个 agent → 它之前的复用，它和它之后的重跑
 
 指纹覆盖**最终真正送给模型的输入**，而不只是脚本里写的原始 opts：`prompt` `phase` 以及解析完多级默认值后的 `model` `effort` `sandbox`，外加 `schema` `agentType` `agentSystemPrompt` `isolation` `worktreeKey` `cwd`。
 
 这意味着改 `phase` 名、改 agentType 定义文件的正文、改 run 级默认 model，都会正确地让缓存失效——它们都会改变模型看到的提示词。改 `label` 这种纯展示字段则不会导致重跑。
+
+模拟运行和真实运行不共享结果缓存。缓存命中会写入本次 journal，支持连续恢复。带 worktree 隔离的调用从该位置开始重跑，避免复用文本却没有恢复对应文件状态。
 
 **正因如此，脚本里禁用了 `Date.now()`、`new Date()`（无参）、`Math.random()`** —— 它们会让同一段脚本每次产生不同的 prompt，缓存永远失效。需要时间戳就通过 `args` 传进来；需要制造差异就用 `index` 或 label。
 
@@ -411,6 +413,8 @@ journal 逐条记录了每个 agent 的真实返回值、耗时、重试次数�
 | `workflow_runs` | 列出历史 run，找可 resume 的 runId |
 | `workflow_inspect` | 读某次 run 的 journal，看每个 agent 的真实返回值 |
 
+`workflow_run` 必须显式传入目标项目的绝对路径 `cwd`。MCP 进程从插件目录启动，不能用其工作目录推断用户项目。
+
 `workflow_run` 执行期间会通过 MCP 进度通知实时汇报阶段与 agent 状态。
 
 ---
@@ -432,7 +436,7 @@ cdw mcp                          以 MCP stdio server 运行
 | 选项 | 说明 |
 | --- | --- |
 | `--args <json>` | 传给脚本的 args，支持内联 JSON 或 `@文件` |
-| `--budget <n>` | output token 预算上限 |
+| `--budget <n>` | output token 派发阈值 |
 | `--concurrency <n>` | 并发上限，默认 `min(16, cpu-2)` |
 | `--model` / `--effort` / `--sandbox` | run 级默认值，可被 agent opts 覆盖 |
 | `--cwd <dir>` | 工作目录 |
@@ -508,3 +512,17 @@ npm test
 - **MCP + CLI 测试** —— 真实起 MCP server 子进程走 JSON-RPC 握手；所有内置 workflow 在 dry-run 下完整跑一遍
 
 桩的存在是有意的：它让引擎的语义在无网络、无凭证的环境下也能被完整验证，CI 里同样跑得动。
+
+脚本在禁用动态代码生成的独立 VM 上下文中执行，钩子边界仅交换 JSON 数据，不暴露宿主 Node 对象。Node VM 不是操作系统安全沙箱：只运行可信来源的 workflow，不用于托管恶意脚本。
+
+### 真实模型验收（会消耗额度）
+
+安装插件后，可以通过已安装副本的 MCP server 在独立测试仓库中验收：
+
+```bash
+node scripts/smoke-real.mjs /absolute/path/to/installed-plugin /absolute/path/to/results
+```
+
+脚本依次运行 `review-changes`、小规模 `design-panel` 和 worktree 隔离的 `migrate`；检查预置缺陷是否被确认、方案是否生成、迁移后真实文件与测试是否通过，以及主工作区是否保持原样。结果和 journal 保存在指定目录。它不包含在 `npm test` 中。
+
+`import()` 在校验时被保守拒绝（字面量或注释中的同样写法也会触发）；需要加载模块的工作交给子 agent。

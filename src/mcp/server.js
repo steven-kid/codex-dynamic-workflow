@@ -46,7 +46,7 @@ export const meta = {
 脚本跑在独立 vm context 中，只有 JS 语言内建能力：无 fetch、无 process、无 require、无 setTimeout、不能 import 模块，I/O 交给子 agent 做。脚本的 return 值即为 workflow 结果。`;
 
 export function createServer({ cwd = process.cwd() } = {}) {
-  const server = new McpServer({ name: 'codex-dynamic-workflow', version: '0.1.0' });
+  const server = new McpServer({ name: 'codex-dynamic-workflow', version: '0.1.1' });
 
   server.registerTool({
     name: 'workflow_run',
@@ -62,8 +62,8 @@ ${SCRIPT_GUIDE}`,
         scriptPath: { type: 'string', description: '脚本文件路径；每次运行都会把脚本存档，便于改后续跑' },
         name: { type: 'string', description: '命名 workflow（见 workflow_list）' },
         args: { description: '传给脚本的 args，原样透传，可以是任意 JSON 值' },
-        cwd: { type: 'string', description: '工作目录，默认当前目录' },
-        budget: { type: 'number', description: 'output token 预算上限；用尽后 agent() 抛错' },
+        cwd: { type: 'string', description: '必填：目标项目的绝对路径，不是插件安装目录' },
+        budget: { type: 'number', description: 'output token 派发阈值；用尽后 agent() 抛错' },
         concurrency: { type: 'number', description: `并发 agent 上限，默认 ${defaultConcurrency()}` },
         model: { type: 'string', description: '默认模型，可被脚本内 opts.model 覆盖' },
         effort: {
@@ -79,15 +79,18 @@ ${SCRIPT_GUIDE}`,
         dryRun: { type: 'boolean', description: '不调模型，用占位结果验证控制流' },
         resumeFromRunId: { type: 'string', description: '从历史 run 恢复：未变更的调用前缀直接复用缓存' },
       },
+      required: ['cwd'],
       additionalProperties: false,
     },
-    handler: async (input, { sendProgress }) => {
-      const workDir = path.resolve(input.cwd ?? cwd);
+    handler: async (input, { sendProgress, signal }) => {
+      if (typeof input.cwd !== 'string' || !path.isAbsolute(input.cwd)) throw new Error('cwd 必须是目标项目的绝对路径');
+      const workDir = input.cwd;
       const narration = [];
 
       const summary = await runWorkflow({
+        signal,
         script: input.script,
-        scriptPath: input.scriptPath,
+        scriptPath: input.scriptPath ? path.resolve(workDir, input.scriptPath) : undefined,
         workflowName: input.name,
         args: input.args,
         cwd: workDir,
@@ -133,10 +136,12 @@ ${SCRIPT_GUIDE}`,
 
   server.registerTool({
     name: 'workflow_list',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     description: '列出所有可用的命名 workflow（插件内置 + $CODEX_HOME/workflows + 项目 .codex/workflows）',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-    handler: async () => {
-      const files = listWorkflowFiles(cwd);
+    inputSchema: { type: 'object', properties: { cwd: { type: 'string' } }, additionalProperties: false },
+    handler: async (input) => {
+      const workDir = path.resolve(input.cwd ?? cwd);
+      const files = listWorkflowFiles(workDir);
       const items = [];
       for (const [name, file] of files) {
         try {
@@ -152,7 +157,7 @@ ${SCRIPT_GUIDE}`,
           items.push({ name, error: err.message, scriptPath: file });
         }
       }
-      const agents = [...(await loadAgentRegistry(agentDirs(cwd))).values()].map((a) => ({
+      const agents = [...(await loadAgentRegistry(agentDirs(workDir))).values()].map((a) => ({
         name: a.name,
         description: a.description,
       }));
@@ -166,6 +171,7 @@ ${SCRIPT_GUIDE}`,
 
   server.registerTool({
     name: 'workflow_validate',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     description: '校验一段 workflow 脚本的 meta 与语法，不执行任何 agent。写完脚本先跑这个，比直接执行便宜得多。',
     inputSchema: {
       type: 'object',
@@ -184,6 +190,7 @@ ${SCRIPT_GUIDE}`,
 
   server.registerTool({
     name: 'workflow_runs',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     description: '列出历史 run 及其状态，用于找到可 resume 的 runId',
     inputSchema: {
       type: 'object',
@@ -205,6 +212,7 @@ ${SCRIPT_GUIDE}`,
 
   server.registerTool({
     name: 'workflow_inspect',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     description:
       '读取某次 run 的 journal.jsonl，查看每个 agent 的实际返回值。当 workflow 返回空或结果不符预期时，先看这个再下结论。',
     inputSchema: {

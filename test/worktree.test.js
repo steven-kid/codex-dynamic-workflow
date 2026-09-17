@@ -206,3 +206,19 @@ test('createWorktree 记录基准 commit 供 finalize 判断', async () => {
     await wt.remove();
   }
 });
+
+test('恢复隔离调用会重建文件状态，不复用旧 worktree 路径', async () => {
+  const repo = await makeRepo('resume-isolated');
+  const codexBin = await makeShim(repo, 'append');
+  const base = {
+    script: `export const meta={name:'resume-isolated',description:'test'};
+      return await agent('append', {isolation:'worktree',worktreeKey:'same-key'});`,
+    cwd: repo, codexBin,
+  };
+  const first = await runWorkflow(base);
+  const second = await runWorkflow({...base,resumeFromRunId:first.runId});
+  assert.equal(second.agentCount,1);
+  assert.equal(second.result,'base,STAGE,');
+  assert.notEqual(second.worktrees[0].path,first.worktrees[0].path);
+  assert.equal(await fsp.readFile(path.join(second.worktrees[0].path,'f.txt'),'utf8'),'base\nSTAGE\n');
+});

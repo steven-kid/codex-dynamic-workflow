@@ -24,6 +24,8 @@ import path from 'node:path';
 export function fingerprint(prompt, resolved = {}) {
   const significant = {
     prompt,
+    dryRun: resolved.dryRun ?? false,
+    fullAuto: resolved.fullAuto ?? false,
     phase: resolved.phase ?? null,
     model: resolved.model ?? null,
     effort: resolved.effort ?? null,
@@ -72,7 +74,7 @@ export class Journal {
     try {
       raw = await fsp.readFile(priorFile, 'utf8');
     } catch {
-      return { loaded: 0 };
+      throw new Error(`无法恢复：找不到历史 journal ${priorFile}`);
     }
     let loaded = 0;
     for (const line of raw.split('\n')) {

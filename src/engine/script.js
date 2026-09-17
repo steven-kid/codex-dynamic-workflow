@@ -12,6 +12,7 @@
 import vm from 'node:vm';
 
 import { WorkflowScriptError } from './errors.js';
+import { MAX_ITEMS_PER_CALL } from './constants.js';
 
 const META_START_RE = /export\s+const\s+meta\s*=\s*\{/;
 
@@ -129,95 +130,125 @@ export function validateMeta(meta) {
 
 /**
  * 把脚本体编译成可执行函数。
- * 注入的钩子以形参方式传入，脚本体在 async function 内运行，可直接 await。
- *
- * 脚本在**独立 vm context** 中编译执行，而不是复用宿主 realm：
- *  - 宿主 realm 里 `fetch`/`process` 等全局对脚本可见，编排脚本本不该碰它们
- *    （I/O 交给子 agent 做），而且 `process.env` 可读意味着脚本能拿到环境变量；
- *  - 只在包装函数里声明局部 `Date`/`Math` 只能遮蔽标识符，
- *    `globalThis.Date.now()` 可以绕过，确定性守卫形同虚设。
- * 独立 context 默认就没有 `fetch`/`process`/`setTimeout`，再把 context 上的
- * `Date`/`Math` 替换为代理，绕不过去。
+ * 脚本在独立 vm context 的 async function 内运行，可直接 await。
+ * 宿主钩子只经 JSON bridge 调用，不能直接把宿主函数/对象注入脚本 realm。
  */
 export function compileScript(source, { filename = 'workflow.js' } = {}) {
   const { meta, body } = parseMeta(source);
+  // Node may reject import() with a host-realm Error before invoking a custom
+  // loader. Reject it at validation time so that object never reaches the VM.
+  // This conservative check also rejects import() text in literals/comments.
+  if (/\bimport(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*(?:\n|$))*\(/.test(body)) {
+    throw new WorkflowScriptError('workflow 脚本不支持 import()；需要模块的操作请交给 agent');
+  }
 
-  const hookNames = [
-    'agent',
-    'parallel',
-    'pipeline',
-    'phase',
-    'log',
-    'args',
-    'budget',
-    'workflow',
-    'meta',
-  ];
-
-  const wrapped = `(async function workflowBody(${hookNames.join(', ')}) {
-${body}
-})`;
-
-  const context = createScriptContext();
-
-  let run;
+  // Only JSON strings cross the context boundary. Never expose host functions,
+  // promises, errors or result objects to workflow code (constructor escapes).
   try {
-    run = vm.runInContext(wrapped, context, { filename });
+    new vm.Script(`(async function() {${body}\n})`, { filename });
   } catch (err) {
     throw new WorkflowScriptError(`脚本语法错误：${err.message}`, { cause: err });
   }
 
-  if (typeof run !== 'function') {
-    throw new WorkflowScriptError('脚本编译结果异常，请检查 meta 之后的脚本体');
-  }
-
+  const run = async (hooks = {}) => {
+    const invoke = async (name, encoded) => {
+      try {
+        const value = await hooks[name](...JSON.parse(encoded));
+        return JSON.stringify({ value });
+      } catch (err) {
+        return JSON.stringify({ error: { name: err.name, message: err.message } });
+      }
+    };
+    const sync = (name, encoded) => {
+      try {
+        const value = name === 'budget'
+          ? { total: hooks.budget?.total ?? null, spent: hooks.budget?.spent() ?? 0 }
+          : hooks[name](...JSON.parse(encoded));
+        return JSON.stringify({ value });
+      } catch (err) {
+        return JSON.stringify({ error: { name: err.name, message: err.message } });
+      }
+    };
+    const context = vm.createContext(Object.assign(Object.create(null), {
+      __invoke: invoke, __sync: sync,
+      __data: JSON.stringify({ args: hooks.args, meta }),
+    }), { codeGeneration: { strings: false, wasm: false } });
+    new vm.Script(`
+      ((invoke, sync, data) => {
+        delete globalThis.__invoke; delete globalThis.__sync; delete globalThis.__data;
+        const decode = text => {
+          const packet = JSON.parse(text);
+          if (packet.error) {
+            const error = new Error(packet.error.message);
+            error.name = packet.error.name;
+            throw error;
+          }
+          return packet.value;
+        };
+        const fail = (message, name = 'WorkflowScriptError') => { const e = new Error(message); e.name = name; throw e; };
+        const fatal = e => ['WorkflowAbortError', 'BudgetExhaustedError', 'WorkflowLimitError', 'WorkflowScriptError'].includes(e?.name);
+        const check = items => {
+          if (!Array.isArray(items)) fail('parallel/pipeline 需要一个数组');
+          if (items.length > ${MAX_ITEMS_PER_CALL}) fail('parallel/pipeline 最多接受 ${MAX_ITEMS_PER_CALL} 个条目', 'WorkflowLimitError');
+        };
+        const guarded = async (fn, event) => {
+          try { return await fn(); }
+          catch (e) { if (fatal(e)) throw e; decode(sync('reportFailure', JSON.stringify([{ ...event, message: e.message }]))); return null; }
+        };
+        for (const name of ['agent', 'workflow']) {
+          globalThis[name] = async (...values) => decode(await invoke(name, JSON.stringify(values)));
+        }
+        for (const name of ['phase', 'log']) {
+          globalThis[name] = (...values) => decode(sync(name, JSON.stringify(values)));
+        }
+        globalThis.parallel = async thunks => {
+          check(thunks);
+          if (thunks.some(t => typeof t !== 'function')) fail('parallel 需要函数数组');
+          return Promise.all(thunks.map((t, index) => guarded(t, { type: 'branch.failed', index })));
+        };
+        globalThis.pipeline = async (items, ...stages) => {
+          check(items);
+          if (stages.some(s => typeof s !== 'function')) fail('pipeline stage 必须是函数');
+          return Promise.all(items.map((item, index) => guarded(async () => {
+            let value = item;
+            for (const stage of stages) value = await stage(value, item, index);
+            return value;
+          }, { type: 'item.dropped', index })));
+        };
+        globalThis.budget = Object.freeze({
+          get total() { return decode(sync('budget', '[]')).total; },
+          spent: () => decode(sync('budget', '[]')).spent,
+          remaining: () => { const b = decode(sync('budget', '[]')); return b.total === null ? Infinity : Math.max(0, b.total - b.spent); },
+        });
+        globalThis.args = undefined;
+        Object.assign(globalThis, JSON.parse(data));
+        const NativeDate = Date;
+        const deniedDate = () => { throw new Error('workflow 脚本禁止使用 Date.now()/new Date()/Date()'); };
+        function FixedDate(...values) {
+          if (!new.target || !values.length) deniedDate();
+          return Reflect.construct(NativeDate, values, FixedDate);
+        }
+        FixedDate.prototype = NativeDate.prototype;
+        FixedDate.now = deniedDate;
+        FixedDate.parse = NativeDate.parse; FixedDate.UTC = NativeDate.UTC;
+        Object.setPrototypeOf(FixedDate, Function.prototype);
+        Object.defineProperty(NativeDate.prototype, 'constructor', { value: FixedDate });
+        NativeDate.now = deniedDate;
+        globalThis.Date = new Proxy(FixedDate, { apply: deniedDate });
+        Object.defineProperty(Math, 'random', { value: () => { throw new Error('workflow 脚本禁止使用 Math.random()'); }, writable: false, configurable: false });
+      })(__invoke, __sync, __data);
+    `).runInContext(context, { timeout: 1000 });
+    try {
+      // The body is compiled separately, so it cannot capture the private bridge.
+      const result = await new vm.Script(`(async () => {${body}\n})()`, { filename })
+        .runInContext(context, { timeout: 1000 });
+      return result === undefined ? undefined : JSON.parse(JSON.stringify(result));
+    } catch (err) {
+      // Restore engine error identity after crossing realms.
+      const errors = await import('./errors.js');
+      const Type = errors[err.name] ?? Error;
+      throw new Type(err.message);
+    }
+  };
   return { meta, run };
-}
-
-/** 这些非确定性 API 会让同一段脚本每次产生不同 prompt，使 resume 缓存永远失效 */
-const DETERMINISM_HINT = {
-  'Date.now': '请通过 args 传入时间戳',
-  'new Date()': '请通过 args 传入时间戳',
-  'Math.random': '请用 index 或 label 制造差异',
-};
-
-function deny(api) {
-  throw new Error(`workflow 脚本禁止使用 ${api}()：会破坏 resume 确定性，${DETERMINISM_HINT[api]}`);
-}
-
-/**
- * 构造脚本运行的独立 context。
- * 显式放行编排真正需要的全局，其余（fetch / process / setTimeout / require 等）一概不提供。
- */
-export function createScriptContext() {
-  const context = vm.createContext(Object.create(null));
-
-  // 在 context 内部取原生 Date/Math 再包代理——不能引用宿主的，
-  // 否则脚本里 `x instanceof Date` 之类的跨 realm 判断会失真
-  const install = vm.runInContext(
-    `(function (deny) {
-      const RawDate = Date;
-      const RawMath = Math;
-      globalThis.Date = new Proxy(RawDate, {
-        construct(target, argv) {
-          if (argv.length === 0) deny('new Date()');
-          return Reflect.construct(target, argv);
-        },
-        get(target, prop, receiver) {
-          if (prop === 'now') deny('Date.now');
-          return Reflect.get(target, prop, receiver);
-        },
-      });
-      globalThis.Math = new Proxy(RawMath, {
-        get(target, prop, receiver) {
-          if (prop === 'random') deny('Math.random');
-          return Reflect.get(target, prop, receiver);
-        },
-      });
-    })`,
-    context,
-  );
-  install(deny);
-
-  return context;
 }

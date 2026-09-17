@@ -13,6 +13,8 @@ export const PROTOCOL_VERSION = '2025-06-18';
 
 export class McpServer {
   #tools = new Map();
+  #requests = new Map();
+  #closing = false;
   #name;
   #version;
   #stdin;
@@ -40,7 +42,17 @@ export class McpServer {
       this.#buffer = Buffer.concat([this.#buffer, chunk]);
       this.#drain();
     });
-    this.#stdin.on('end', () => process.exit(0));
+    const close = () => {
+      this.#closing = true;
+      for (const controller of this.#requests.values()) controller.abort();
+      this.#stdin.destroy();
+    };
+    this.#stdin.on('end', close);
+    // Terminate active agents before the MCP process exits on host shutdown.
+    if (this.#stdin === process.stdin) {
+      process.once('SIGTERM', close);
+      process.once('SIGINT', close);
+    }
   }
 
   /** 同时支持 Content-Length 帧与逐行 JSON */
@@ -94,7 +106,10 @@ export class McpServer {
   async #handle(message) {
     const { id, method, params } = message;
     // 通知（无 id）不需要回包
-    if (id === undefined) return;
+    if (id === undefined) {
+      if (method === 'notifications/cancelled') this.#requests.get(params?.requestId)?.abort();
+      return;
+    }
 
     switch (method) {
       case 'initialize':
@@ -120,6 +135,7 @@ export class McpServer {
               name: t.name,
               description: t.description,
               inputSchema: t.inputSchema,
+              annotations: t.annotations,
             })),
           },
         });
@@ -133,9 +149,13 @@ export class McpServer {
             error: { code: -32602, message: `未知工具: ${params?.name}` },
           });
         }
+        const controller = new AbortController();
+        this.#requests.set(id, controller);
+        let progress = 0;
         try {
           const result = await tool.handler(params.arguments ?? {}, {
-            sendProgress: (text) => this.#notifyProgress(params?._meta?.progressToken, text),
+            signal: controller.signal,
+            sendProgress: (text) => this.#notifyProgress(params?._meta?.progressToken, text, ++progress),
           });
           return this.#send({ jsonrpc: '2.0', id, result });
         } catch (err) {
@@ -148,12 +168,16 @@ export class McpServer {
               content: [{ type: 'text', text: `工具执行失败: ${err?.message ?? err}` }],
             },
           });
+        } finally {
+          this.#requests.delete(id);
         }
       }
 
       case 'shutdown':
         this.#send({ jsonrpc: '2.0', id, result: {} });
-        setTimeout(() => process.exit(0), 10);
+        this.#closing = true;
+        for (const controller of this.#requests.values()) controller.abort();
+        this.#stdin.destroy();
         return undefined;
 
       default:
@@ -165,16 +189,17 @@ export class McpServer {
     }
   }
 
-  #notifyProgress(token, text) {
-    if (!token) return;
+  #notifyProgress(token, text, progress) {
+    if (token === undefined || token === null) return;
     this.#send({
       jsonrpc: '2.0',
       method: 'notifications/progress',
-      params: { progressToken: token, message: text },
+      params: { progressToken: token, progress, message: text },
     });
   }
 
   #send(payload) {
+    if (this.#closing) return;
     const json = JSON.stringify(payload);
     if (this.#useFraming) {
       this.#stdout.write(`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`);

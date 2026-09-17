@@ -254,3 +254,31 @@ test('describeEvent 把引擎事件压成人话', () => {
   assert.match(describeEvent({ type: 'agent.completed', label: 'x', durationMs: 5 }), /✔ x/);
   assert.equal(describeEvent({ type: 'unknown' }), null);
 });
+
+test('进度含递增 progress，支持 token=0；取消会终止 workflow', async () => {
+  const dir = await fsp.mkdtemp(path.join(workDir, 'cancel-'));
+  const server = startServer(dir);
+  try {
+    await server.request('initialize', {});
+    const response = server.request('tools/call', {
+      name: 'workflow_run', _meta: { progressToken: 0 }, arguments: {
+        cwd: dir,
+        script: 'export const meta = {name:"cancel",description:"test"}; return await parallel(Array.from({length:100},()=>()=>agent("task")));',
+        concurrency: 1,
+      },
+    });
+    // request ids: initialize=1, tools/call=2
+    while (!server.notifications.some(n => n.params?.message?.startsWith('◐'))) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    server.child.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:2}})+'\n');
+    const result = await response;
+    assert.equal(result.result.isError, true);
+    const progress = server.notifications.filter(n => n.method === 'notifications/progress');
+    assert.ok(progress.length > 0);
+    progress.forEach((n, index) => { assert.equal(n.params.progressToken, 0); assert.equal(n.params.progress, index + 1); });
+    const runs = await server.request('tools/call', {name:'workflow_runs',arguments:{cwd:dir}});
+    assert.equal(runs.result.structuredContent.runs[0].status, 'failed');
+    assert.ok(runs.result.structuredContent.runs[0].agentCount <= 1);
+  } finally { server.stop(); }
+});

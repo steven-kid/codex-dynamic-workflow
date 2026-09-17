@@ -3,10 +3,12 @@
     "dynamic-workflow": {
       "command": "node",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/bin/cdw.js",
+        "bin/cdw.js",
         "mcp"
       ],
-      "env": {}
+      "env": {},
+      "cwd": ".",
+      "tool_timeout_sec": 3600
     }
   }
 }

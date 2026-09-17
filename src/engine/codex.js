@@ -163,6 +163,7 @@ export async function runCodexExec({
       cwd: cwd ?? process.cwd(),
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     });
 
     const state = {
@@ -174,11 +175,27 @@ export async function runCodexExec({
       stderr: [],
     };
 
-    const abortHandler = () => child.kill('SIGTERM');
+    const kill = signalName => {
+      if (!child.pid) return;
+      try {
+        if (process.platform === 'win32') child.kill(signalName);
+        else process.kill(-child.pid, signalName);
+      } catch (err) {
+        // Some hosts deny process-group signals; still stop our direct child.
+        if (err.code === 'EPERM') {
+          if (child.exitCode === null && child.signalCode === null) child.kill(signalName);
+        } else if (err.code !== 'ESRCH') throw err;
+      }
+    };
+    let killTimer;
+    const abortHandler = () => {
+      kill('SIGTERM');
+      killTimer ??= setTimeout(() => kill('SIGKILL'), 1000);
+      killTimer.unref();
+    };
     if (signal) {
       if (signal.aborted) {
-        child.kill('SIGKILL');
-        throw new WorkflowAbortError('run 已中止');
+        abortHandler();
       }
       signal.addEventListener('abort', abortHandler, { once: true });
     }
@@ -187,10 +204,11 @@ export async function runCodexExec({
     const timer = timeoutMs
       ? setTimeout(() => {
           timedOut = true;
-          child.kill('SIGKILL');
+          kill('SIGKILL');
         }, timeoutMs)
       : null;
 
+    child.stdin.on('error', () => {});
     child.stdin.end(prompt);
 
     const stdoutLines = createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -208,9 +226,14 @@ export async function runCodexExec({
       if (state.stderr.length > 50) state.stderr.shift();
     });
 
-    const [exitCode] = await once(child, 'close');
-    if (timer) clearTimeout(timer);
-    if (signal) signal.removeEventListener('abort', abortHandler);
+    let exitCode;
+    try {
+      [exitCode] = await once(child, 'close');
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (killTimer) { clearTimeout(killTimer); kill('SIGKILL'); }
+      if (signal) signal.removeEventListener('abort', abortHandler);
+    }
 
     if (signal?.aborted) throw new WorkflowAbortError('run 已中止');
     if (timedOut) {

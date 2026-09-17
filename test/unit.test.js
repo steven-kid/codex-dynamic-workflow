@@ -352,3 +352,9 @@ test('parseArgs 解析 CLI 参数', () => {
   assert.equal(opts['dry-run'], true);
   assert.equal(opts.args, '{"a":1}');
 });
+
+test('动态 import 在执行前被拒绝，避免宿主模块错误泄露', () => {
+  for (const expression of ["import('node:fs')", "import /* comment */ ('node:fs')", "import // comment\n ('node:fs')"]) {
+    assert.throws(() => compileScript(`export const meta={name:'imports',description:'test'}; return ${expression};`), /不支持 import/);
+  }
+});
