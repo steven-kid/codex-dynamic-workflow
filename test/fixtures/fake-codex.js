@@ -2,7 +2,7 @@
 /**
  * 测试桩：模拟 `codex exec --json` 的行为。
  *
- * 本机 codex 未登录，无法真实调用模型，因此用这个桩做端到端验证：
+ * 默认回归使用这个桩，不依赖登录状态或付费模型调用：
  * 它解析真实的 codex 参数（--output-schema / --output-last-message / --cd / -c ...），
  * 从 stdin 读 prompt，按 CDW_FAKE_MODE 决定行为，并输出与真实 codex 一致的
  * thread events JSONL。
@@ -59,8 +59,9 @@ process.stdin.on('end', async () => {
   });
 
   let finalText;
-  if (schemaPath) {
-    const schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+  const promptedSchema = prompt.match(/JSON Schema:\n([\s\S]*?)\n\n/);
+  if (schemaPath || promptedSchema) {
+    const schema = JSON.parse(schemaPath ? fs.readFileSync(schemaPath, 'utf8') : promptedSchema[1]);
     // badschema 模式：第一次返回不合规内容，制造一次 schema 重试
     const isCorrection = prompt.includes('上一次输出不合规');
     finalText =
@@ -76,6 +77,7 @@ process.stdin.on('end', async () => {
     finalText = `echo:${firstLineOfTask(prompt)}`;
   }
 
+  if (process.env.CDW_FAKE_RESPONSE !== undefined) finalText = process.env.CDW_FAKE_RESPONSE;
   emit({ type: 'item.completed', item: { id: 'item_3', type: 'agent_message', text: finalText } });
   emit({
     type: 'turn.completed',

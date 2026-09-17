@@ -26,11 +26,15 @@ const selected =
 
 const FINDINGS_SCHEMA = {
   type: 'object',
+  required: ['findings'],
+  additionalProperties: false,
   properties: {
     findings: {
       type: 'array',
       items: {
         type: 'object',
+        required: ['file', 'line', 'severity', 'summary', 'failureScenario'],
+        additionalProperties: false,
         properties: {
           file: { type: 'string' },
           line: { type: 'number' },
@@ -45,6 +49,8 @@ const FINDINGS_SCHEMA = {
 
 const VERDICT_SCHEMA = {
   type: 'object',
+  required: ['real', 'confidence', 'reasoning'],
+  additionalProperties: false,
   properties: {
     real: { type: 'boolean' },
     confidence: { type: 'string', enum: ['high', 'medium', 'low'] },

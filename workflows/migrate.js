@@ -19,11 +19,15 @@ const isolate = args && args.isolate === true;
 
 const SITES_SCHEMA = {
   type: 'object',
+  required: ['sites'],
+  additionalProperties: false,
   properties: {
     sites: {
       type: 'array',
       items: {
         type: 'object',
+        required: ['file', 'reason'],
+        additionalProperties: false,
         properties: {
           file: { type: 'string' },
           reason: { type: 'string' },
@@ -35,6 +39,8 @@ const SITES_SCHEMA = {
 
 const VERIFY_SCHEMA = {
   type: 'object',
+  required: ['ok', 'problems'],
+  additionalProperties: false,
   properties: {
     ok: { type: 'boolean' },
     problems: { type: 'array', items: { type: 'string' } },
@@ -49,7 +55,8 @@ const discovery = await agent(
   { label: 'discover', phase: 'Discover', agentType: 'explorer', schema: SITES_SCHEMA },
 );
 
-const sites = (discovery && discovery.sites) || [];
+if (discovery === null) throw new Error('发现改造点的 agent 失败，不能视为没有改造点');
+const sites = discovery.sites || [];
 if (sites.length === 0) {
   log('没有找到需要改造的位置');
   return { sites: [], results: [] };

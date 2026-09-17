@@ -37,6 +37,7 @@ import { buildAgentPrompt, defaultLabel } from './prompt.js';
 import { assertRootSchema, extractJson, validateAgainstSchema } from './schema.js';
 import { Semaphore } from './semaphore.js';
 import { compileScript } from './script.js';
+import { listWorkflowFiles, workflowDirs as defaultWorkflowDirs, agentDirs as defaultAgentDirs } from '../util/paths.js';
 import { createWorktree, isGitRepo } from './worktree.js';
 
 /** run id 生成：脚本里禁用了 Date.now/Math.random，但引擎自身可以用 */
@@ -87,6 +88,8 @@ class RunContext {
     this.cwd = options.cwd;
     this.codexBin = options.codexBin;
     this.defaultModel = options.model ?? null;
+    this.modelMap = options.modelMap ?? {};
+    this.budgetBlocked = false;
     this.defaultEffort = options.effort ?? null;
     this.defaultSandbox = options.sandbox ?? 'workspace-write';
     this.fullAuto = options.fullAuto ?? false;
@@ -125,6 +128,7 @@ class RunContext {
   assertRunnable({ checkLimit = true } = {}) {
     if (this.signal?.aborted) throw new WorkflowAbortError('run 已中止');
     if (this.budgetTotal !== null && this.spentOutputTokens >= this.budgetTotal) {
+      this.budgetBlocked = true;
       throw new BudgetExhaustedError(
         `token 预算已用尽（${this.spentOutputTokens}/${this.budgetTotal} output tokens）`,
         { total: this.budgetTotal, spent: this.spentOutputTokens },
@@ -155,8 +159,8 @@ export async function runWorkflow(options) {
     transcriptRoot,
     resumeFromRunId = null,
     resumeDir = null,
-    agentDirs = [],
-    workflowDirs = [],
+    agentDirs = defaultAgentDirs(cwd),
+    workflowDirs = defaultWorkflowDirs(cwd),
     ...rest
   } = options;
 
@@ -164,7 +168,7 @@ export async function runWorkflow(options) {
   assertPositiveInt(concurrency, 'concurrency');
   if (budget !== null && budget !== undefined) assertNonNegativeNumber(budget, 'budget');
 
-  const source = await resolveSource({ script, scriptPath, workflowName, workflowDirs });
+  const source = await resolveSource({ script, scriptPath, workflowName: workflowName ?? options.name, workflowDirs, cwd });
   const { meta, run } = compileScript(source.text, { filename: source.filename });
 
   const runId = makeRunId();
@@ -182,11 +186,7 @@ export async function runWorkflow(options) {
   // 脚本原文落盘：用户改脚本后可用 scriptPath + resumeFromRunId 续跑
   await fsp.writeFile(path.join(dir, 'workflow.js'), source.text, 'utf8');
 
-  const registry = await loadAgentRegistry([
-    ...agentDirs,
-    path.join(cwd, '.codex', 'agents'),
-    path.join(cwd, '.agents', 'agents'),
-  ]);
+  const registry = await loadAgentRegistry(agentDirs);
 
   const emit = (event) => {
     const enriched = { runId, ...event };
@@ -241,7 +241,7 @@ export async function runWorkflow(options) {
     await Promise.allSettled([...ctx.pendingAgents]);
     signal?.removeEventListener('abort', abort);
   }
-  if (status === 'ok' && budget !== null && ctx.spentOutputTokens > budget) {
+  if (status === 'ok' && budget !== null && (ctx.spentOutputTokens > budget || ctx.budgetBlocked)) {
     status = 'budget_exhausted';
     error = new BudgetExhaustedError('token 预算已用尽（已运行请求可能超额）', { total: budget, spent: ctx.spentOutputTokens });
   }
@@ -262,7 +262,7 @@ export async function runWorkflow(options) {
     workflow: meta.name,
     meta,
     status,
-    result: status === 'ok' ? toHostRealm(result ?? null) : null,
+    result: toHostRealm(result ?? null),
     error: error ? { name: error.name, message: error.message } : null,
     usage: ctx.usage,
     agentCount: ctx.agentCount,
@@ -286,6 +286,7 @@ function buildHooks(ctx, { args, meta }) {
   let currentPhase = null;
 
   const agent = async (prompt, opts = {}) => {
+    if (!opts || typeof opts !== 'object' || Array.isArray(opts)) throw new WorkflowScriptError('agent opts 必须是对象');
     if (typeof prompt !== 'string' || !prompt.trim()) {
       throw new WorkflowScriptError('agent(prompt) 的 prompt 必须是非空字符串');
     }
@@ -327,7 +328,7 @@ function buildHooks(ctx, { args, meta }) {
   return { agent, phase, log, args, budget, workflow, meta, reportFailure: event => ctx.emit(event) };
 }
 
-/** 这些错误不该被 parallel/pipeline 吞掉，必须终止整个 run */
+/** 这些错误不能作为模型执行失败重试。分支如何收集错误由 script.js 决定。 */
 function isFatal(err) {
   return (
     err instanceof WorkflowAbortError ||
@@ -353,6 +354,12 @@ async function runAgent(ctx, prompt, opts) {
     throw new WorkflowScriptError(`未知的 agentType "${agentType}"，可用：${known}`);
   }
 
+  if (agentDef.unsupported?.length) {
+    throw new WorkflowScriptError(`agentType "${agentType}" 包含尚不能等价映射的 Claude 配置：${agentDef.unsupported.join(', ')}；请提供 .codex/agents 下的适配定义`);
+  }
+  if (opts.isolation !== undefined && opts.isolation !== 'worktree') {
+    throw new WorkflowScriptError('isolation 只支持 worktree');
+  }
   if (opts.effort && !EFFORT_LEVELS.includes(opts.effort)) {
     throw new WorkflowScriptError(
       `非法的 effort "${opts.effort}"，可选：${EFFORT_LEVELS.join(' | ')}`,
@@ -364,10 +371,10 @@ async function runAgent(ctx, prompt, opts) {
     );
   }
 
-  const schema = opts.schema ? assertRootSchema(opts.schema) : null;
+  const schema = opts.schema !== undefined ? assertRootSchema(opts.schema) : null;
   const resolved = {
     phase: opts.phase ?? null,
-    model: opts.model ?? agentDef.model ?? ctx.defaultModel,
+    model: resolveModel(opts.model ?? agentDef.model, ctx.defaultModel, ctx.modelMap),
     effort: opts.effort ?? agentDef.effort ?? ctx.defaultEffort,
     sandbox: opts.sandbox ?? agentDef.sandbox ?? ctx.defaultSandbox,
     schema,
@@ -436,6 +443,8 @@ async function runAgent(ctx, prompt, opts) {
     let attempt = 0;
     let correction = null;
     let lastError = null;
+    let processFailures = 0;
+    let schemaFailures = 0;
 
     // 两层重试：进程级失败走 maxRetries，schema 不合规走 schemaRetries
     const maxAttempts = 1 + ctx.maxRetries + (schema ? ctx.schemaRetries : 0);
@@ -478,12 +487,14 @@ async function runAgent(ctx, prompt, opts) {
           if (!parsed.ok) {
             correction = `上次输出无法解析为 JSON：${parsed.error}`;
             lastError = new AgentError(correction, { agentId, label });
+            if (schemaFailures++ >= ctx.schemaRetries) break;
             continue;
           }
           const check = validateAgainstSchema(parsed.value, schema);
           if (!check.valid) {
             correction = `上次输出不符合 schema：\n- ${check.errors.slice(0, 8).join('\n- ')}`;
             lastError = new AgentError(correction, { agentId, label });
+            if (schemaFailures++ >= ctx.schemaRetries) break;
             continue;
           }
           value = parsed.value;
@@ -527,12 +538,13 @@ async function runAgent(ctx, prompt, opts) {
           maxAttempts,
           message: err.message,
         });
+        if (processFailures++ >= ctx.maxRetries) break;
       }
     }
 
     const failure = new AgentError(
-      `agent "${label}" 在 ${maxAttempts} 次尝试后仍失败：${lastError?.message ?? '未知错误'}`,
-      { agentId, label, attempts: maxAttempts, cause: lastError },
+      `agent "${label}" 在 ${attempt} 次尝试后仍失败：${lastError?.message ?? '未知错误'}`,
+      { agentId, label, attempts: attempt, cause: lastError },
     );
     ctx.journal.append({
       kind: 'agent',
@@ -541,12 +553,12 @@ async function runAgent(ctx, prompt, opts) {
       label,
       fingerprint: fp,
       status: 'failed',
-      attempts: maxAttempts,
+      attempts: attempt,
       error: failure.message,
       durationMs: Date.now() - startedAt,
     });
     ctx.emit({ type: 'agent.failed', seq, agentId, label, message: failure.message });
-    throw failure;
+    return null;
   });
 }
 
@@ -590,6 +602,7 @@ async function runChildWorkflow({ ctx, nameOrRef, childArgs, workflowDirs, cwd }
     scriptPath: typeof nameOrRef === 'object' ? nameOrRef.scriptPath : undefined,
     workflowName: typeof nameOrRef === 'string' ? nameOrRef : undefined,
     workflowDirs,
+    cwd,
   });
   const { meta, run } = compileScript(source.text, { filename: source.filename });
 
@@ -613,30 +626,29 @@ async function runChildWorkflow({ ctx, nameOrRef, childArgs, workflowDirs, cwd }
 }
 
 /** 解析脚本来源：内联 script / scriptPath / 命名 workflow */
-export async function resolveSource({ script, scriptPath, workflowName, workflowDirs = [] }) {
-  if (script) return { text: script, filename: 'inline-workflow.js' };
-
+export async function resolveSource({ script, scriptPath, workflowName, workflowDirs = [], cwd = process.cwd() }) {
   if (scriptPath) {
-    const text = await fsp.readFile(scriptPath, 'utf8');
-    return { text, filename: scriptPath };
+    const filename = path.resolve(cwd, scriptPath);
+    return { text: await fsp.readFile(filename, 'utf8'), filename };
   }
-
+  if (script) return { text: script, filename: 'inline-workflow.js' };
   if (workflowName) {
-    for (const dir of workflowDirs) {
-      const candidate = path.join(dir, `${workflowName}.js`);
-      try {
-        const text = await fsp.readFile(candidate, 'utf8');
-        return { text, filename: candidate };
-      } catch {
-        /* 下一个目录 */
-      }
-    }
-    throw new WorkflowScriptError(
-      `找不到名为 "${workflowName}" 的 workflow，已搜索：${workflowDirs.join(', ') || '(无)'}`,
-    );
+    const filename = listWorkflowFiles(cwd, workflowDirs).get(workflowName);
+    if (filename) return { text: await fsp.readFile(filename, 'utf8'), filename };
+    throw new WorkflowScriptError(`找不到名为 "${workflowName}" 的 workflow，已搜索：${workflowDirs.join(', ') || '(无)'}`);
   }
-
   throw new WorkflowScriptError('必须提供 script、scriptPath 或 workflowName 之一');
+}
+
+export function resolveModel(model, fallback, modelMap = {}) {
+  const requested = !model || model === 'inherit' ? fallback : model;
+  if (requested == null || requested === 'inherit') return null;
+  const resolved = Object.hasOwn(modelMap, requested) ? modelMap[requested] : requested;
+  if (typeof resolved !== 'string' || !resolved.trim()) throw new WorkflowScriptError('modelMap 的目标必须是非空 Codex 模型名');
+  if (/^(?:opus|sonnet|haiku)(?:\[.*\])?$|^claude-/i.test(resolved)) {
+    throw new WorkflowScriptError(`Claude 模型 "${requested}" 不能直接用于 Codex；请通过 modelMap 显式映射到可用的 Codex 模型`);
+  }
+  return resolved;
 }
 
 export { DEFAULT_AGENT };

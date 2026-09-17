@@ -34,9 +34,9 @@ export const meta = {
 脚本体在 async 上下文中运行，可直接 await。可用钩子：
   agent(prompt, opts?)        派发子 agent。opts: {label, phase, schema, model, effort, sandbox, agentType, isolation:'worktree', worktreeKey, timeoutMs, cwd}
                               同 worktreeKey 的多个 agent 共用一份 worktree（多阶段需读同一份改动时必须带）
-                              带 schema 时返回校验过的对象，否则返回字符串；失败返回 null（在 parallel/pipeline 内）
+                              带 schema 时返回校验过的对象，否则返回字符串；终态执行失败返回 null（包括单独调用）；非法参数仍报错
   parallel(thunks)            屏障：等齐全部；单个失败降级为 null，需 .filter(Boolean)
-  pipeline(items, ...stages)  无屏障流水线，默认首选；stage 签名 (prev, originalItem, index)
+  pipeline(items, ...stages)  无屏障流水线，默认首选；stage 签名 (prev, originalItem, index)，null 会跳过后续阶段
   phase(title) / log(msg)     进度分组与叙述
   args                        调用方传入的参数
   budget                      {total, spent(), remaining()}，total 为 null 表示不限
@@ -46,7 +46,7 @@ export const meta = {
 脚本跑在独立 vm context 中，只有 JS 语言内建能力：无 fetch、无 process、无 require、无 setTimeout、不能 import 模块，I/O 交给子 agent 做。脚本的 return 值即为 workflow 结果。`;
 
 export function createServer({ cwd = process.cwd() } = {}) {
-  const server = new McpServer({ name: 'codex-dynamic-workflow', version: '0.1.1' });
+  const server = new McpServer({ name: 'codex-dynamic-workflow', version: '0.1.2' });
 
   server.registerTool({
     name: 'workflow_run',
@@ -58,9 +58,12 @@ ${SCRIPT_GUIDE}`,
     inputSchema: {
       type: 'object',
       properties: {
-        script: { type: 'string', description: '内联 workflow 脚本源码（与 scriptPath/name 三选一）' },
+        script: { type: 'string', description: '内联 workflow 脚本源码（scriptPath 优先，其次 script，最后 name）' },
         scriptPath: { type: 'string', description: '脚本文件路径；每次运行都会把脚本存档，便于改后续跑' },
         name: { type: 'string', description: '命名 workflow（见 workflow_list）' },
+        description: { type: 'string', description: '兼容官方旧参数；忽略，以 meta.description 为准' },
+        title: { type: 'string', description: '兼容官方旧参数；忽略，以 meta 为准' },
+        modelMap: { type: 'object', additionalProperties: { type: 'string' }, description: 'Claude 模型别名到 Codex 模型的显式映射，例如 {"sonnet":"gpt-6-astra"}' },
         args: { description: '传给脚本的 args，原样透传，可以是任意 JSON 值' },
         cwd: { type: 'string', description: '必填：目标项目的绝对路径，不是插件安装目录' },
         budget: { type: 'number', description: 'output token 派发阈值；用尽后 agent() 抛错' },
@@ -68,7 +71,7 @@ ${SCRIPT_GUIDE}`,
         model: { type: 'string', description: '默认模型，可被脚本内 opts.model 覆盖' },
         effort: {
           type: 'string',
-          enum: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+          enum: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
           description: '默认推理档位',
         },
         sandbox: {
@@ -97,6 +100,7 @@ ${SCRIPT_GUIDE}`,
         budget: input.budget ?? null,
         concurrency: input.concurrency ?? defaultConcurrency(),
         model: input.model ?? null,
+        modelMap: input.modelMap,
         effort: input.effort ?? null,
         sandbox: input.sandbox,
         dryRun: Boolean(input.dryRun),

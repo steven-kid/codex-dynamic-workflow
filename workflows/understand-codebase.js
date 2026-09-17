@@ -22,12 +22,16 @@ const LENSES = [
 
 const MAP_SCHEMA = {
   type: 'object',
+  required: ['summary', 'keyFiles', 'notes', 'openQuestions'],
+  additionalProperties: false,
   properties: {
     summary: { type: 'string' },
     keyFiles: {
       type: 'array',
       items: {
         type: 'object',
+        required: ['path', 'role'],
+        additionalProperties: false,
         properties: { path: { type: 'string' }, role: { type: 'string' } },
       },
     },
@@ -47,7 +51,7 @@ const surveys = await parallel(
         `用 grep/find 定位，读片段而不是整文件。结论要落到具体文件路径。` +
         `不确定的地方放进 openQuestions，不要猜。`,
       { label: `survey:${lens.key}`, phase: 'Survey', agentType: 'explorer', schema: MAP_SCHEMA },
-    ).then((result) => ({ lens: lens.key, ...result })),
+    ).then((result) => result === null ? null : ({ lens: lens.key, ...result })),
   ),
 );
 

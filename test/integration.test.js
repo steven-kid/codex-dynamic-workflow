@@ -209,7 +209,7 @@ return { calls: out.length, remaining: budget.remaining() }
   assert.equal(summary.status, 'budget_exhausted');
   assert.equal(summary.agentCount, 3);
   assert.equal(summary.usage.outputTokens, 150);
-  assert.equal(summary.result, null);
+  assert.deepEqual(summary.result, {calls:3,remaining:0});
 });
 
 test('预算派发阈值：用尽后再调 agent() 抛错，run 记为 budget_exhausted', async () => {
@@ -706,4 +706,56 @@ test('不存在的 codex 二进制立即失败并清理超时句柄', async () =
     runOptions: { codexBin: '/nonexistent/cdw-test-codex', maxRetries: 0 },
   });
   assert.deepEqual(summary.result, [null]);
+});
+
+test('Claude standalone agent terminal failure returns null and pipeline skips downstream', async () => {
+  const {summary,events}=await run(`export const meta={name:'failure-null',description:'compat'};
+    const first=await agent('task',undefined);
+    const rows=await pipeline([1],()=>agent('task'),()=>{throw new Error('must not run')});
+    return {first,rows};`,{fakeEnv:{CDW_FAKE_MODE:'crash'}});
+  assert.deepEqual(summary.result,{first:null,rows:[null]});
+  assert.equal(events.filter(e=>e.type==='agent.failed').length,2);
+  assert.equal(events.filter(e=>e.type==='item.dropped').length,0);
+});
+
+test('Claude optional schema fields can be omitted by a real subprocess response',async()=>{
+  const {summary}=await run(`export const meta={name:'optional',description:'compat'};
+    return await agent('task',{schema:{type:'object',properties:{value:{type:'number'},note:{type:'string'}},required:['value'],additionalProperties:false}});`,
+    {fakeEnv:{CDW_FAKE_RESPONSE:'{"value":7}'}});
+  assert.deepEqual(summary.result,{value:7});
+});
+
+test('Claude schema failures get five corrections then null; process retries stay separate',async()=>{
+ const {summary,dir}=await run(`export const meta={name:'invalid-schema-output',description:'compat'};
+ return await agent('task',{schema:{type:'object',properties:{value:{type:'number'}},required:['value']}});`,
+ {fakeEnv:{CDW_FAKE_RESPONSE:'{"value":"bad"}'},runOptions:{maxRetries:1}});
+ assert.equal(summary.result,null);
+ const lines=(await fsp.readFile(summary.journalFile,'utf8')).trim().split('\n').map(JSON.parse);
+ assert.equal(lines.find(x=>x.kind==='agent'&&x.status==='failed').attempts,6);
+ const failed=await run(`export const meta={name:'process-failure',description:'compat'};return await agent('task',{schema:{type:'object'}});`,
+ {fakeEnv:{CDW_FAKE_MODE:'crash'},runOptions:{maxRetries:1}});
+ const records=(await fsp.readFile(failed.summary.journalFile,'utf8')).trim().split('\n').map(JSON.parse);
+ assert.equal(records.find(x=>x.kind==='agent'&&x.status==='failed').attempts,2);
+});
+
+test('budget blocks queued branches while preserving completed and in-flight results',async()=>{
+ const {summary}=await run(`export const meta={name:'budget-branches',description:'compat'};
+ return await parallel([()=>agent('one'),()=>agent('two'),()=>agent('three')]);`,
+ {concurrency:2,runOptions:{budget:50},fakeEnv:{CDW_FAKE_DELAY_MS:50}});
+ assert.equal(summary.status,'budget_exhausted');assert.equal(summary.agentCount,2);
+ assert.deepEqual(summary.result,['echo:one','echo:two',null]);
+});
+
+test('built-in design-panel does not turn failed null proposals into successful objects',async()=>{
+ await assert.rejects(()=>runWorkflow({
+   cwd:workDir,workflowName:'design-panel',args:{question:'test',angles:[{key:'one',prompt:'test'}]},
+   codexBin:'/definitely/missing/codex',maxRetries:0,transcriptRoot:path.join(workDir,'panel-failure'),
+ }),/所有方案 agent 都失败/);
+});
+
+test('built-in migrate cannot report zero migration sites when discovery fails',async()=>{
+ await assert.rejects(()=>runWorkflow({
+   cwd:workDir,workflowName:'migrate',args:{instruction:'test'},
+   codexBin:'/definitely/missing/codex',maxRetries:0,transcriptRoot:path.join(workDir,'migrate-failure'),
+ }),/发现改造点的 agent 失败/);
 });

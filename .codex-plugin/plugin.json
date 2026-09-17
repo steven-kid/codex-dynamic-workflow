@@ -1,6 +1,6 @@
 {
   "name": "codex-dynamic-workflow",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Dynamic Workflow for Codex: orchestrate many codex subagents from a deterministic JS script (fan-out, pipelines, adversarial verification, token budgets, resume).",
   "author": {
     "name": "wangyuchao.404"

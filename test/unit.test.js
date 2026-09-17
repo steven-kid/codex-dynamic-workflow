@@ -10,7 +10,7 @@ import { Semaphore } from '../src/engine/semaphore.js';
 import { fingerprint } from '../src/engine/journal.js';
 import { parseArgs, parseNumericOption } from '../src/cli.js';
 
-test('normalizeSchema 递归补齐 strict 模式要求的字段', () => {
+test('normalizeSchema 保留可选字段和开放对象语义', () => {
   const out = normalizeSchema({
     type: 'object',
     properties: {
@@ -20,11 +20,11 @@ test('normalizeSchema 递归补齐 strict 模式要求的字段', () => {
       },
     },
   });
-  assert.equal(out.additionalProperties, false);
-  assert.deepEqual(out.required, ['findings']);
+  assert.equal(out.additionalProperties, undefined);
+  assert.equal(out.required, undefined);
   const item = out.properties.findings.items;
-  assert.equal(item.additionalProperties, false);
-  assert.deepEqual(item.required, ['file', 'line']);
+  assert.equal(item.additionalProperties, undefined);
+  assert.equal(item.required, undefined);
 });
 
 test('normalizeSchema 处理 $defs 与 anyOf 分支', () => {
@@ -35,12 +35,13 @@ test('normalizeSchema 处理 $defs 与 anyOf 分支', () => {
       Node: { type: 'object', properties: { name: { type: 'string' } } },
     },
   });
-  assert.equal(out.$defs.Node.additionalProperties, false);
-  assert.deepEqual(out.$defs.Node.required, ['name']);
+  assert.equal(out.$defs.Node.additionalProperties, undefined);
+  assert.equal(out.$defs.Node.required, undefined);
 });
 
-test('assertRootSchema 拒绝非 object 根', () => {
-  assert.throws(() => assertRootSchema({ type: 'array', items: { type: 'string' } }), /必须是/);
+test('assertRootSchema 允许 JSON Schema 数组根，拒绝无效 schema', () => {
+  assert.equal(assertRootSchema({ type: 'array', items: { type: 'string' } }).type, 'array');
+  assert.throws(() => assertRootSchema({type:'invalid'}), /无效/);
 });
 
 test('extractJson 能剥掉代码围栏和前后寒暄', () => {

@@ -4,7 +4,7 @@
  * 设计原则：区分「用户脚本写错了」(WorkflowScriptError)、
  * 「引擎拒绝执行」(WorkflowLimitError / BudgetExhaustedError)
  * 与「子 agent 执行失败」(AgentError)。
- * 只有 AgentError 会被 parallel/pipeline 降级为 null，其余一律向上冒泡终止整个 run。
+ * parallel/pipeline 收集分支错误为 null；全局取消仍中止运行。
  */
 
 export class WorkflowError extends Error {

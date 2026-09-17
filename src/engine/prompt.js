@@ -16,7 +16,7 @@ const RETURN_VALUE_CONTRACT = `你正作为一个自动化 workflow 中的子 ag
 - 只输出结果内容本身。`;
 
 const STRUCTURED_CONTRACT = `
-- 本次调用要求结构化输出：你的最终消息必须是**单个 JSON 对象**，严格符合下面的 JSON Schema。
+- 本次调用要求结构化输出：你的最终消息必须是**单个 JSON 值**，严格符合下面的 JSON Schema。
 - 不要加 \`\`\` 代码围栏，不要在 JSON 前后附加任何文字。
 
 JSON Schema:
@@ -25,7 +25,7 @@ JSON Schema:
 /**
  * @param {object} p
  * @param {string} p.prompt 用户在脚本里写的任务描述
- * @param {object|null} p.schema 结构化输出 schema（已 normalize）
+ * @param {object|null} p.schema 结构化输出 schema（保留原始语义）
  * @param {string} p.agentSystemPrompt 来自 agentType 定义的追加 system prompt
  * @param {string|null} p.phase 当前 phase 名，作为上下文提示
  * @param {string|null} p.correction schema 校验失败后的纠正说明

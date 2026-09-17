@@ -31,6 +31,8 @@ const CRITERIA = (args && args.criteria) || [
 
 const PROPOSAL_SCHEMA = {
   type: 'object',
+  required: ['approach', 'steps', 'tradeoffs', 'risks'],
+  additionalProperties: false,
   properties: {
     approach: { type: 'string' },
     steps: { type: 'array', items: { type: 'string' } },
@@ -41,11 +43,15 @@ const PROPOSAL_SCHEMA = {
 
 const SCORE_SCHEMA = {
   type: 'object',
+  required: ['scores', 'best'],
+  additionalProperties: false,
   properties: {
     scores: {
       type: 'array',
       items: {
         type: 'object',
+        required: ['proposal', 'score', 'rationale'],
+        additionalProperties: false,
         properties: {
           proposal: { type: 'string' },
           score: { type: 'number' },
@@ -68,7 +74,7 @@ const proposals = (
           `先读相关代码再下结论，不要泛泛而谈。明确列出取舍与风险，不要只讲优点。\n\n` +
           `问题：${question}`,
         { label: `propose:${angle.key}`, phase: 'Propose', schema: PROPOSAL_SCHEMA, effort: 'high' },
-      ).then((p) => ({ angle: angle.key, ...p })),
+      ).then((p) => p === null ? null : ({ angle: angle.key, ...p })),
     ),
   )
 ).filter(Boolean);
@@ -87,7 +93,7 @@ const judgements = (
           `【评分标准】${criterion}\n\n` +
           `问题：${question}\n\n方案：\n${JSON.stringify(proposals, null, 2)}`,
         { label: `judge:${criterion}`, phase: 'Judge', schema: SCORE_SCHEMA, effort: 'high' },
-      ).then((j) => ({ criterion, ...j })),
+      ).then((j) => j === null ? null : ({ criterion, ...j })),
     ),
   )
 ).filter(Boolean);

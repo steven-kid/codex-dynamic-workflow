@@ -25,11 +25,15 @@ const LENSES = ['correctness', 'security', 'reproducibility'];
 
 const BUGS_SCHEMA = {
   type: 'object',
+  required: ['bugs'],
+  additionalProperties: false,
   properties: {
     bugs: {
       type: 'array',
       items: {
         type: 'object',
+        required: ['file', 'line', 'title', 'failureScenario'],
+        additionalProperties: false,
         properties: {
           file: { type: 'string' },
           line: { type: 'number' },
@@ -43,6 +47,8 @@ const BUGS_SCHEMA = {
 
 const VERDICT_SCHEMA = {
   type: 'object',
+  required: ['real', 'reasoning'],
+  additionalProperties: false,
   properties: {
     real: { type: 'boolean' },
     reasoning: { type: 'string' },

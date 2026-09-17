@@ -88,7 +88,7 @@ const data = await agent('找出所有 TODO', {
   phase: 'Scan',              // 显式归入某个 phase 分组
   schema: TODO_SCHEMA,        // 结构化输出（见 §3）
   model: 'o3',                // 覆盖默认模型
-  effort: 'high',             // minimal | low | medium | high | xhigh
+  effort: 'high',             // minimal | low | medium | high | xhigh | max
   sandbox: 'read-only',       // read-only | workspace-write | danger-full-access
   agentType: 'explorer',      // 使用预设的 agent 人设（见 §4）
   isolation: 'worktree',      // 独立 git worktree，防并行写冲突
@@ -98,7 +98,7 @@ const data = await agent('找出所有 TODO', {
 })
 ```
 
-在 `parallel` / `pipeline` 内部，失败的 agent **降级为 `null`** 而不是炸掉整个 run —— 所以记得 `.filter(Boolean)`。
+`agent()` 在执行失败并耗尽重试后返回 `null`，包括单独调用。非法参数仍抛错。`pipeline` 遇到 `null` 会跳过该项的后续阶段；收集结果时记得处理空值。
 
 ### `pipeline(items, ...stages)` —— 默认首选
 
@@ -118,7 +118,7 @@ const results = await pipeline(
 
 ### `parallel(thunks)` —— 屏障
 
-并发执行并**等齐所有结果**。普通分支失败解析为 `null`；取消、预算耗尽、脚本错误和运行上限会终止整个 run。
+并发执行并**等齐所有结果**。分支抛错或拒绝时该位置返回 `null`，其余分支继续。调用本身的参数校验错误和全局取消仍会抛出。预算用尽会停止新派发，保留已完成与正在运行的结果。
 
 ```js
 const votes = await parallel([
@@ -204,11 +204,15 @@ const custom = await workflow({ scriptPath: './my-sub.js' }, { x: 1 })
 ```js
 const FINDINGS = {
   type: 'object',
+  required: ['findings'],
+  additionalProperties: false,
   properties: {
     findings: {
       type: 'array',
       items: {
         type: 'object',
+        required: ['file', 'line', 'severity'],
+        additionalProperties: false,
         properties: {
           file: { type: 'string' },
           line: { type: 'number' },
@@ -220,15 +224,12 @@ const FINDINGS = {
 }
 
 const result = await agent('审查这个文件', { schema: FINDINGS })
-result.findings.forEach((f) => log(`${f.file}:${f.line}`))
+result?.findings.forEach((f) => log(`${f.file}:${f.line}`))
 ```
 
-**你不需要手写 strict 模式那一堆样板。** Codex 底层走 OpenAI Structured Outputs 严格模式，要求每个 object 都显式写 `additionalProperties: false`、`required` 必须列全所有 property。引擎会**自动递归补齐**这些字段（含 `$defs`、`anyOf` 分支、数组 items）。
+**引擎保留原始 JSON Schema 语义。** `required` 之外的属性可以省略，`additionalProperties` 不会被自动改写。已满足 Codex 严格输出子集的 schema 直接传给 `--output-schema`；其他 schema 使用提示词约束 JSON，再由打包的 Ajv 校验原始 schema。支持 draft-07、2019-09、2020-12（用 `$schema` 指定），包括组合条件、引用、数值/字符串约束等。
 
-要表达「可选字段」，用 nullable 而不是省略：`{ type: ['string', 'null'] }`。
-
-**校验失败会自动纠正重试一次**：模型返回的 JSON 解析不出来、或形状不符 schema 时，引擎会把具体的错误信息回灌给模型让它重来，而不是把脏数据交给下游 stage。
-
+JSON 解析或 schema 校验失败最多纠正重试 5 次，仍失败返回 `null`；进程重试单独计数。内置 workflow 已明确声明自身需要的必填字段。
 > 实现细节：Codex 有个已知行为（openai/codex#19816），schema 会被施加到一个 turn 内**每一条** agent_message 上，包括工具调用前的中间播报。所以不能用「第一条合法 JSON」当结果。本引擎优先读取 `--output-last-message` 写出的文件，天然取到最后一条。
 
 ---
@@ -483,7 +484,7 @@ codex-dynamic-workflow/
 │   │   ├── runner.js             编排核心：钩子、并发、预算、resume
 │   │   ├── codex.js              codex exec 适配与事件解析
 │   │   ├── script.js             meta 解析与脚本编译
-│   │   ├── schema.js             strict schema 规范化与校验
+│   │   ├── schema.js             原始 schema 校验与严格输出适配
 │   │   ├── journal.js            journal 与 resume 缓存
 │   │   ├── agents.js             agentType 注册表
 │   │   ├── worktree.js           git worktree 隔离
@@ -507,8 +508,8 @@ npm test
 
 88 个测试，分三层：
 
-- **单元测试** —— schema 规范化、meta 解析、事件解析、信号量、指纹
-- **集成测试** —— 用 `test/fixtures/fake-codex.js` 桩替代真实 codex 二进制，真实拉起子进程走完整的 JSONL 事件解析，覆盖 parallel/pipeline 语义、失败降级、预算硬上限、并发上限、resume 缓存、子 workflow 计数、中止信号
+- **单元测试** —— schema 语义与校验、meta 解析、事件解析、信号量、指纹
+- **集成测试** —— 用 `test/fixtures/fake-codex.js` 桩替代真实 codex 二进制，真实拉起子进程走完整的 JSONL 事件解析，覆盖 parallel/pipeline 语义、失败降级、预算派发阈值、并发上限、resume 缓存、子 workflow 计数、中止信号
 - **MCP + CLI 测试** —— 真实起 MCP server 子进程走 JSON-RPC 握手；所有内置 workflow 在 dry-run 下完整跑一遍
 
 桩的存在是有意的：它让引擎的语义在无网络、无凭证的环境下也能被完整验证，CI 里同样跑得动。
@@ -526,3 +527,41 @@ node scripts/smoke-real.mjs /absolute/path/to/installed-plugin /absolute/path/to
 脚本依次运行 `review-changes`、小规模 `design-panel` 和 worktree 隔离的 `migrate`；检查预置缺陷是否被确认、方案是否生成、迁移后真实文件与测试是否通过，以及主工作区是否保持原样。结果和 journal 保存在指定目录。它不包含在 `npm test` 中。
 
 `import()` 在校验时被保守拒绝（字面量或注释中的同样写法也会触发）；需要加载模块的工作交给子 agent。
+
+
+## Claude Code workflow 兼容
+
+对照 [Claude Code 官方 workflow 文档](https://code.claude.com/docs/en/workflows) 和本机官方 CLI 2.1.221 的 Workflow 类型、原语参考与运行时行为核对。兼容范围是脚本编排协议；不宣称 Codex 与 Claude 的模型、权限或宿主 UI 相同。
+
+| 接口 | 行为 |
+| --- | --- |
+| `agent(prompt, {label, phase, schema, model, effort, isolation, agentType})` | 保留参数名；终态执行失败为 `null`；`effort` 支持 `low/medium/high/xhigh/max`，另保留 Codex 的 `minimal` |
+| `parallel(thunks)` | 按输入顺序收集结果，分支拒绝为 `null`，等待其余分支 |
+| `pipeline(items, ...stages)` | 等待 Promise 输入；stage 收到 `(prev, originalItem, index)`；`null` 短路；逐项独立运行 |
+| `phase(title)`、`log(message)`、`args` | 同名使用，`args` 可以是任意 JSON 值，省略为 `undefined` |
+| `workflow(nameOrRef, args?)` | 支持名称与 `{scriptPath}`，路径相对目标 `cwd`，嵌套一层，共享预算和并发 |
+| `budget` | `total/spent()/remaining()`；统计本次插件 run，无法读取 Claude 主会话的整轮预算 |
+| MCP `workflow_run` | `scriptPath` 优先于 `script`、再优先于 `name`；接受但忽略旧 `description/title`；额外要求目标项目绝对 `cwd` |
+
+命名 workflow 以 **`meta.name`** 注册，文件名可以不同。同名覆盖顺序从低到高：插件内置 → `~/.claude/workflows`（支持 `CLAUDE_CONFIG_DIR`）→ `$CODEX_HOME/workflows` → 项目 `.claude/workflows` → `.codex/workflows` → `.agents/workflows`。Agent 目录同理。项目里的原 `.claude/workflows/*.js` 可以直接加载，不必复制或改扩展名。
+
+Claude 模型别名不能作为 Codex 模型 ID 使用。通过调用参数配置映射，保留原脚本中的 `model: 'sonnet'` 等写法：
+
+```sh
+cdw run --name my-workflow --cwd /absolute/project \
+  --model-map '{"sonnet":"gpt-6-astra","opus":"gpt-6-astra","haiku":"gpt-6-astra"}'
+```
+
+MCP 使用同名 `modelMap` 对象。映射目标请选账户可用的 Codex 模型；示例不是能力或成本等级的对应承诺。不指定模型时使用 Codex 默认模型；自定义 agent 的 `model: inherit` 继承 run 默认值。未映射的 Claude 模型会明确报错。
+
+`.claude/agents` 支持 YAML frontmatter、正文提示、`name/description/model/effort`。Claude 特有的 `tools/disallowedTools/permissionMode/hooks/mcpServers/skills/memory/background/maxTurns/isolation` 尚不能等价迁移，选中这类 agent 会明确报错，需要在优先级更高的 `.codex/agents` 提供适配定义。Claude 宿主提供的内建 agent 类型和插件命名空间也不会自动出现。`isolation: 'worktree'` 使用本插件独立 worktree；`sandbox/worktreeKey/cwd/timeoutMs` 是 Codex 扩展。
+
+其余边界：MCP 同步返回结果，没有 Claude 的 `/workflows` 后台任务 UI；resume 使用本插件 journal；全局取消终止 run。VM 只供可信脚本，动态 import 被保守拒绝（包括字符串/注释里的 import 调用文本）。
+
+开发时运行 `npm ci && npm run build:vendor` 可重建打包的 JSON Schema/YAML/meta 解析器；安装插件不需要 npm install。第三方版本、许可证随 `src/vendor` 一起分发。
+
+新增兼容性实测脚本（会调用 2 个真实模型 agent，另运行 2 次缓存恢复）：
+
+```sh
+node scripts/smoke-compat-real.mjs /absolute/installed-plugin-root /absolute/output-dir
+```

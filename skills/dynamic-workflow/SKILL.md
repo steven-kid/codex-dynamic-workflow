@@ -56,11 +56,15 @@ const DIMENSIONS = [
 
 const FINDINGS = {
   type: 'object',
+  required: ['findings'],
+  additionalProperties: false,
   properties: {
     findings: {
       type: 'array',
       items: {
         type: 'object',
+        required: ['file', 'line', 'summary'],
+        additionalProperties: false,
         properties: {
           file: { type: 'string' },
           line: { type: 'number' },
@@ -81,7 +85,7 @@ const results = await pipeline(
         agent(`请尝试证伪这条发现：${f.summary}（${f.file}:${f.line}）。不确定时默认判为不成立。`, {
           label: `verify:${f.file}`,
           phase: 'Verify',
-          schema: { type: 'object', properties: { real: { type: 'boolean' }, why: { type: 'string' } } },
+          schema: { type: 'object', required: ['real', 'why'], additionalProperties: false, properties: { real: { type: 'boolean' }, why: { type: 'string' } } },
         }).then((v) => ({ ...f, verdict: v })),
       ),
     ),
@@ -94,13 +98,15 @@ return { confirmed: results.flat().filter(Boolean).filter((f) => f.verdict?.real
 
 | 钩子 | 说明 |
 | --- | --- |
-| `agent(prompt, opts?)` | 派发子 agent。有 `schema` 返回对象，否则返回字符串。在 `parallel`/`pipeline` 内失败降级为 `null` |
+| `agent(prompt, opts?)` | 派发子 agent。有 `schema` 返回对象，否则返回字符串。终态执行失败返回 `null`，包括单独调用 |
 | `parallel(thunks)` | **屏障**：等齐全部。单分支失败为 `null`，记得 `.filter(Boolean)` |
 | `pipeline(items, ...stages)` | **无屏障**流水线，默认首选。stage 签名 `(prev, originalItem, index)` |
 | `phase(title)` / `log(msg)` | 进度分组与叙述 |
 | `args` | 调用方传入的参数，原样透传 |
 | `budget` | `{total, spent(), remaining()}`，`total` 为 `null` 表示不限 |
 | `workflow(nameOrRef, args)` | 内联子 workflow，只允许一层嵌套 |
+
+`pipeline` 遇到 `null` 会跳过该项后续 stage。`effort` 支持 `low/medium/high/xhigh/max`（另支持 Codex `minimal`）。原 `.claude/workflows` 按 `meta.name` 加载；Claude 模型别名需在 `workflow_run` 的 `modelMap` 中显式映射。Schema 保留可选字段语义，不会自动把属性改成必填。
 
 `agent` 的 opts：`label` `phase` `schema` `model` `effort` `sandbox` `agentType`
 `isolation:'worktree'` `worktreeKey` `timeoutMs` `cwd`。

@@ -1,6 +1,6 @@
 {
   "name": "codex-dynamic-workflow",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Dynamic Workflow for Codex CLI: deterministic multi-agent orchestration with agent/parallel/pipeline/phase/budget/resume",
   "type": "module",
   "bin": {
@@ -15,7 +15,8 @@
   },
   "scripts": {
     "test": "node --test --test-concurrency=2 test/*.test.js",
-    "cdw": "node ./bin/cdw.js"
+    "cdw": "node ./bin/cdw.js",
+    "build:vendor": "node scripts/build-vendor.mjs"
   },
   "files": [
     "bin",
@@ -27,5 +28,12 @@
     ".mcp.json"
   ],
   "license": "MIT",
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "ajv": "8.17.1",
+    "ajv-formats": "3.0.1",
+    "esbuild": "0.25.10",
+    "json5": "2.2.3",
+    "yaml": "2.8.1"
+  }
 }

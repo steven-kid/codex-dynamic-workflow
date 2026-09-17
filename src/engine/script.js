@@ -10,6 +10,7 @@
  */
 
 import vm from 'node:vm';
+import { JSON5 } from '../vendor/validation.js';
 
 import { WorkflowScriptError } from './errors.js';
 import { MAX_ITEMS_PER_CALL } from './constants.js';
@@ -27,15 +28,20 @@ function locateMeta(source) {
   const braceStart = start.index + start[0].length - 1;
   let depth = 0;
   let inString = null;
+  let comment = null;
 
   for (let i = braceStart; i < source.length; i += 1) {
     const ch = source[i];
 
+    if (comment === 'line') { if (ch === '\n') comment = null; continue; }
+    if (comment === 'block') { if (ch === '*' && source[i + 1] === '/') { comment = null; i++; } continue; }
     if (inString) {
       if (ch === '\\') i += 1;
       else if (ch === inString) inString = null;
       continue;
     }
+    if (ch === '/' && source[i + 1] === '/') { comment = 'line'; i++; continue; }
+    if (ch === '/' && source[i + 1] === '*') { comment = 'block'; i++; continue; }
     if (ch === '"' || ch === "'" || ch === '`') {
       inString = ch;
       continue;
@@ -56,7 +62,7 @@ function locateMeta(source) {
 
 /**
  * 不执行脚本，静态解析出 meta。
- * 用受限的 vm context 求值字面量，避免 eval 到任意代码。
+ * 用 JSON5 解析对象字面量，不执行表达式。
  */
 export function parseMeta(source) {
   const located = locateMeta(source);
@@ -66,13 +72,11 @@ export function parseMeta(source) {
     );
   }
 
-  assertPureLiteral(located.literal);
-
   let meta;
   try {
-    meta = vm.runInNewContext(`(${located.literal})`, Object.create(null), { timeout: 200 });
+    meta = JSON5.parse(located.literal);
   } catch (err) {
-    throw new WorkflowScriptError(`meta 解析失败：${err.message}`);
+    throw new WorkflowScriptError(`meta 必须是纯字面量：${err.message}`);
   }
 
   validateMeta(meta);
@@ -85,23 +89,6 @@ export function parseMeta(source) {
       source.slice(located.start, located.end).replace(/[^\n]/g, '') +
       source.slice(located.end),
   };
-}
-
-/** meta 里出现函数调用/模板插值/展开语法时直接拒绝 */
-function assertPureLiteral(literal) {
-  const banned = [
-    [/`/, '模板字符串'],
-    [/\.\.\./, '展开语法'],
-    [/=>/, '箭头函数'],
-    [/\bfunction\b/, '函数声明'],
-    [/\brequire\s*\(/, 'require 调用'],
-    [/\w\s*\(/, '函数调用'],
-  ];
-  for (const [re, label] of banned) {
-    if (re.test(literal)) {
-      throw new WorkflowScriptError(`meta 必须是纯字面量，检测到${label}`);
-    }
-  }
 }
 
 export function validateMeta(meta) {
@@ -186,32 +173,40 @@ export function compileScript(source, { filename = 'workflow.js' } = {}) {
           return packet.value;
         };
         const fail = (message, name = 'WorkflowScriptError') => { const e = new Error(message); e.name = name; throw e; };
-        const fatal = e => ['WorkflowAbortError', 'BudgetExhaustedError', 'WorkflowLimitError', 'WorkflowScriptError'].includes(e?.name);
+        const fatal = e => e?.name === 'WorkflowAbortError';
         const check = items => {
           if (!Array.isArray(items)) fail('parallel/pipeline 需要一个数组');
           if (items.length > ${MAX_ITEMS_PER_CALL}) fail('parallel/pipeline 最多接受 ${MAX_ITEMS_PER_CALL} 个条目', 'WorkflowLimitError');
         };
         const guarded = async (fn, event) => {
           try { return await fn(); }
-          catch (e) { if (fatal(e)) throw e; decode(sync('reportFailure', JSON.stringify([{ ...event, message: e.message }]))); return null; }
+          catch (e) { if (fatal(e)) throw e; decode(sync('reportFailure', JSON.stringify([{ ...event, message: e?.message ?? String(e) }]))); return null; }
         };
         for (const name of ['agent', 'workflow']) {
-          globalThis[name] = async (...values) => decode(await invoke(name, JSON.stringify(values)));
+          globalThis[name] = async (...values) => {
+            while (values.length && values[values.length - 1] === undefined) values.pop();
+            return decode(await invoke(name, JSON.stringify(values)));
+          };
         }
         for (const name of ['phase', 'log']) {
           globalThis[name] = (...values) => decode(sync(name, JSON.stringify(values)));
         }
         globalThis.parallel = async thunks => {
           check(thunks);
+          thunks = Array.from(thunks);
           if (thunks.some(t => typeof t !== 'function')) fail('parallel 需要函数数组');
-          return Promise.all(thunks.map((t, index) => guarded(t, { type: 'branch.failed', index })));
+          return Promise.all(Array.from(thunks).map((t, index) => guarded(t, { type: 'branch.failed', index })));
         };
         globalThis.pipeline = async (items, ...stages) => {
           check(items);
+          if (items.length === 0) return [];
           if (stages.some(s => typeof s !== 'function')) fail('pipeline stage 必须是函数');
-          return Promise.all(items.map((item, index) => guarded(async () => {
-            let value = item;
-            for (const stage of stages) value = await stage(value, item, index);
+          return Promise.all(Array.from(items).map((item, index) => guarded(async () => {
+            let value = await item;
+            for (const stage of [...stages]) {
+              if (value === null) break;
+              value = await stage(value, item, index);
+            }
             return value;
           }, { type: 'item.dropped', index })));
         };
@@ -246,8 +241,8 @@ export function compileScript(source, { filename = 'workflow.js' } = {}) {
     } catch (err) {
       // Restore engine error identity after crossing realms.
       const errors = await import('./errors.js');
-      const Type = errors[err.name] ?? Error;
-      throw new Type(err.message);
+      const Type = Object.hasOwn(errors, err?.name) ? errors[err.name] : Error;
+      throw new Type(err?.message ?? String(err));
     }
   };
   return { meta, run };

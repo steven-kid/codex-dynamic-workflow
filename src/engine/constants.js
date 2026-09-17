@@ -21,10 +21,10 @@ export const DEFAULT_AGENT_TIMEOUT_MS = 30 * 60 * 1000;
 export const DEFAULT_MAX_RETRIES = 1;
 
 /** 结构化输出 schema 校验失败时，额外给模型的纠正轮次 */
-export const DEFAULT_SCHEMA_RETRIES = 1;
+export const DEFAULT_SCHEMA_RETRIES = 5;
 
 /** 合法的 reasoning effort 档位 */
-export const EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+export const EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 /** 合法的 sandbox 模式，透传给 codex exec -s */
 export const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];

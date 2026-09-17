@@ -1,3 +1,4 @@
+import { strictOutputSchema } from './schema.js';
 /**
  * Codex CLI 适配层：把一次 agent() 调用翻译成一次 `codex exec --json` 子进程，
  * 并把 JSONL thread events 解析成引擎内部事件。
@@ -140,11 +141,12 @@ export async function runCodexExec({
   keepTempFiles = false,
 }) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cdw-agent-'));
-  const schemaPath = schema ? path.join(tempDir, 'schema.json') : undefined;
+  const transportSchema = strictOutputSchema(schema);
+  const schemaPath = transportSchema ? path.join(tempDir, 'schema.json') : undefined;
   const lastMessagePath = path.join(tempDir, 'last-message.txt');
 
   try {
-    if (schema) await fs.writeFile(schemaPath, JSON.stringify(schema, null, 2), 'utf8');
+    if (transportSchema) await fs.writeFile(schemaPath, JSON.stringify(transportSchema, null, 2), 'utf8');
 
     const args = buildCodexArgs({
       cwd,

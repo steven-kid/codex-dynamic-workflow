@@ -30,7 +30,8 @@ const USAGE = `cdw —— Codex Dynamic Workflow
   --budget <n>           output token 派发阈值，超出后 agent() 抛错
   --concurrency <n>      并发 agent 上限，默认 min(16, cpu-2)
   --model <model>        默认模型，可被 agent opts.model 覆盖
-  --effort <level>       默认推理档位: minimal|low|medium|high|xhigh
+  --model-map <json>     Claude 模型名到 Codex 模型名的 JSON 映射
+  --effort <level>       默认推理档位: minimal|low|medium|high|xhigh|max
   --sandbox <mode>       codex 沙箱: read-only|workspace-write|danger-full-access
   --cwd <dir>            工作目录，默认当前目录
   --dry-run              不调用模型，用占位结果验证脚本控制流
@@ -133,6 +134,7 @@ async function cmdRun(opts) {
         fallback: null,
       }),
       model: opts.model ?? null,
+      modelMap: await parseArgsValue(opts['model-map']),
       effort: opts.effort ?? null,
       sandbox: opts.sandbox ?? undefined,
       fullAuto: Boolean(opts['full-auto']),
