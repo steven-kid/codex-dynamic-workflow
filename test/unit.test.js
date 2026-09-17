@@ -159,6 +159,63 @@ test('compileScript 阻止 Date.now 与 Math.random', async () => {
   await assert.rejects(() => run2(), /Math\.random/);
 });
 
+test('确定性守卫不能被 globalThis 绕过', async () => {
+  // 只声明局部 Date/Math 只能遮蔽标识符，走 globalThis 就能绕开，
+  // 所以脚本必须跑在独立 context 里、由 context 自身的 Date/Math 代理兜底
+  const cases = [
+    ['globalThis.Date.now()', /Date\.now/],
+    ['globalThis.Math.random()', /Math\.random/],
+    ['new globalThis.Date()', /new Date\(\)/],
+    ["globalThis['Date']['now']()", /Date\.now/],
+    ['(0, globalThis.Math.random)()', /Math\.random/],
+  ];
+  for (const [expr, pattern] of cases) {
+    const { run } = compileScript(
+      `export const meta = {\n  name: 'x',\n  description: 'd',\n}\nreturn ${expr}\n`,
+    );
+    await assert.rejects(() => run(), pattern, `${expr} 应被拦截`);
+  }
+});
+
+test('脚本 context 不暴露 I/O 能力', async () => {
+  // 编排脚本不该做 I/O——这些交给子 agent。
+  // process 可见还意味着脚本能读到环境变量。
+  const { run } = compileScript(`export const meta = {
+  name: 'x',
+  description: 'd',
+}
+return {
+  fetch: typeof fetch,
+  process: typeof process,
+  require: typeof require,
+  setTimeout: typeof setTimeout,
+  XMLHttpRequest: typeof XMLHttpRequest,
+}
+`);
+  // 脚本对象来自独立 realm，原型不同，逐字段断言而非 deepStrictEqual
+  const caps = await run();
+  for (const key of ['fetch', 'process', 'require', 'setTimeout', 'XMLHttpRequest']) {
+    assert.equal(caps[key], 'undefined', `${key} 不应对脚本可见`);
+  }
+});
+
+test('脚本仍可使用编排所需的语言内建能力', async () => {
+  const { run } = compileScript(`export const meta = {
+  name: 'x',
+  description: 'd',
+}
+const parsed = JSON.parse('{"a":1}')
+const joined = [3, 1, 2].sort().map(String).join('')
+const awaited = await Promise.all([Promise.resolve('x')])
+return { parsed: parsed.a, joined, awaited: awaited[0], now: new Date(0).getTime() }
+`);
+  const out = await run();
+  assert.equal(out.parsed, 1);
+  assert.equal(out.joined, '123');
+  assert.equal(out.awaited, 'x');
+  assert.equal(out.now, 0, '带参数的 new Date 仍应可用');
+});
+
 test('compileScript 允许带参数的 new Date', async () => {
   const { run } = compileScript(
     "export const meta = {\n  name: 'x',\n  description: 'd',\n}\nreturn new Date(0).getTime()\n",

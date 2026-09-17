@@ -43,7 +43,7 @@ export const meta = {
   workflow(nameOrRef, args)   内联子 workflow，仅支持一层嵌套
 
 禁止使用 Date.now() / new Date() / Math.random()（会破坏 resume 确定性），
-无文件系统与网络 API。脚本的 return 值即为 workflow 结果。`;
+脚本跑在独立 vm context 中，只有 JS 语言内建能力：无 fetch、无 process、无 require、无 setTimeout、不能 import 模块，I/O 交给子 agent 做。脚本的 return 值即为 workflow 结果。`;
 
 export function createServer({ cwd = process.cwd() } = {}) {
   const server = new McpServer({ name: 'codex-dynamic-workflow', version: '0.1.0' });

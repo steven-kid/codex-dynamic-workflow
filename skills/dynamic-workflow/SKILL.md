@@ -135,7 +135,7 @@ return { confirmed: results.flat().filter(Boolean).filter((f) => f.verdict?.real
 
 - 脚本是 JS，**不是 TS**：类型标注会直接语法报错。
 - 禁用 `Date.now()` / `new Date()` / `Math.random()`（破坏 resume 的确定性）。需要时间戳就通过 `args` 传入。
-- 无文件系统、无网络 API —— 这些都交给子 agent 去做。
+- 脚本跑在独立 vm context 中，只有 JS 语言内建能力。无 `fetch`、无 `process`（也读不到环境变量）、无 `require`、无 `setTimeout`、不能 import 模块 —— I/O 都交给子 agent 去做。
 - 单次 `parallel`/`pipeline` 最多 4096 项，单次 run 最多 1000 个 agent。
 - 并发上限默认 `min(16, cpu-2)`，超出的排队。
 

@@ -130,6 +130,14 @@ export function validateMeta(meta) {
 /**
  * 把脚本体编译成可执行函数。
  * 注入的钩子以形参方式传入，脚本体在 async function 内运行，可直接 await。
+ *
+ * 脚本在**独立 vm context** 中编译执行，而不是复用宿主 realm：
+ *  - 宿主 realm 里 `fetch`/`process` 等全局对脚本可见，编排脚本本不该碰它们
+ *    （I/O 交给子 agent 做），而且 `process.env` 可读意味着脚本能拿到环境变量；
+ *  - 只在包装函数里声明局部 `Date`/`Math` 只能遮蔽标识符，
+ *    `globalThis.Date.now()` 可以绕过，确定性守卫形同虚设。
+ * 独立 context 默认就没有 `fetch`/`process`/`setTimeout`，再把 context 上的
+ * `Date`/`Math` 替换为代理，绕不过去。
  */
 export function compileScript(source, { filename = 'workflow.js' } = {}) {
   const { meta, body } = parseMeta(source);
@@ -146,42 +154,70 @@ export function compileScript(source, { filename = 'workflow.js' } = {}) {
     'meta',
   ];
 
-  // 禁止脚本使用会破坏 resume 确定性的 API
-  const wrapped = `
-return (async function workflowBody(${hookNames.join(', ')}) {
-  const Date = new Proxy(globalThis.Date, {
-    construct(target, argv) {
-      if (argv.length === 0) throw new Error('workflow 脚本禁止使用 new Date()：会破坏 resume 确定性，请通过 args 传入时间戳');
-      return Reflect.construct(target, argv);
-    },
-    get(target, prop, receiver) {
-      if (prop === 'now') throw new Error('workflow 脚本禁止使用 Date.now()：会破坏 resume 确定性，请通过 args 传入时间戳');
-      return Reflect.get(target, prop, receiver);
-    },
-  });
-  const Math = new Proxy(globalThis.Math, {
-    get(target, prop, receiver) {
-      if (prop === 'random') throw new Error('workflow 脚本禁止使用 Math.random()：会破坏 resume 确定性，请用 index 或 label 制造差异');
-      return Reflect.get(target, prop, receiver);
-    },
-  });
+  const wrapped = `(async function workflowBody(${hookNames.join(', ')}) {
 ${body}
-});
-`;
+})`;
 
-  let factory;
+  const context = createScriptContext();
+
+  let run;
   try {
-    factory = vm.compileFunction(wrapped, [], { filename });
+    run = vm.runInContext(wrapped, context, { filename });
   } catch (err) {
     throw new WorkflowScriptError(`脚本语法错误：${err.message}`, { cause: err });
   }
 
-  let run;
-  try {
-    run = factory();
-  } catch (err) {
-    throw new WorkflowScriptError(`脚本初始化失败：${err.message}`, { cause: err });
+  if (typeof run !== 'function') {
+    throw new WorkflowScriptError('脚本编译结果异常，请检查 meta 之后的脚本体');
   }
 
   return { meta, run };
+}
+
+/** 这些非确定性 API 会让同一段脚本每次产生不同 prompt，使 resume 缓存永远失效 */
+const DETERMINISM_HINT = {
+  'Date.now': '请通过 args 传入时间戳',
+  'new Date()': '请通过 args 传入时间戳',
+  'Math.random': '请用 index 或 label 制造差异',
+};
+
+function deny(api) {
+  throw new Error(`workflow 脚本禁止使用 ${api}()：会破坏 resume 确定性，${DETERMINISM_HINT[api]}`);
+}
+
+/**
+ * 构造脚本运行的独立 context。
+ * 显式放行编排真正需要的全局，其余（fetch / process / setTimeout / require 等）一概不提供。
+ */
+export function createScriptContext() {
+  const context = vm.createContext(Object.create(null));
+
+  // 在 context 内部取原生 Date/Math 再包代理——不能引用宿主的，
+  // 否则脚本里 `x instanceof Date` 之类的跨 realm 判断会失真
+  const install = vm.runInContext(
+    `(function (deny) {
+      const RawDate = Date;
+      const RawMath = Math;
+      globalThis.Date = new Proxy(RawDate, {
+        construct(target, argv) {
+          if (argv.length === 0) deny('new Date()');
+          return Reflect.construct(target, argv);
+        },
+        get(target, prop, receiver) {
+          if (prop === 'now') deny('Date.now');
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+      globalThis.Math = new Proxy(RawMath, {
+        get(target, prop, receiver) {
+          if (prop === 'random') deny('Math.random');
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+    })`,
+    context,
+  );
+  install(deny);
+
+  return context;
 }

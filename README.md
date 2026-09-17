@@ -457,7 +457,11 @@ cdw mcp                          以 MCP stdio server 运行
 
 **脚本是 JavaScript，不是 TypeScript。** 类型标注（`: string[]`）、interface、泛型都会直接语法报错。
 
-**禁用的 API：** `Date.now()`、无参 `new Date()`、`Math.random()`（破坏 resume 确定性）。没有文件系统和网络 API —— 这些交给子 agent 去做。
+**沙箱：** 脚本运行在独立的 vm context 里，只有 JS 语言内建能力（`JSON`、`Promise`、数组/字符串方法等）。`fetch`、`process`、`require`、`setTimeout`、模块 import 一概不可用——I/O 交给子 agent 去做。`process` 不可见同时意味着脚本读不到环境变量。
+
+**禁用的 API：** `Date.now()`、无参 `new Date()`、`Math.random()`（破坏 resume 确定性）。这三项在 context 层面拦截，`globalThis.Date.now()` 一类写法同样绕不过去。带参数的 `new Date(ts)` 仍可用。
+
+> 因为脚本在独立 realm 中运行，它返回的对象原型与宿主不同。引擎在出口用 `structuredClone` 归一，消费方拿到的是正常的宿主对象。
 
 ---
 

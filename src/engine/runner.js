@@ -60,6 +60,25 @@ function assertNonNegativeNumber(value, name) {
 }
 
 /**
+ * 把脚本 realm 里的返回值归一到宿主 realm。
+ *
+ * 脚本跑在独立 vm context 中（见 script.js），它构造的对象/数组原型来自那个 realm，
+ * 宿主侧 `Array.isArray` 之外的判断（instanceof、deepStrictEqual）都会失真，
+ * 消费方拿到的也是异原型对象。这里在引擎出口统一转成宿主 realm 的普通值。
+ *
+ * 不可结构化克隆的值（函数、Symbol 等）本就不该作为 workflow 结果，
+ * 遇到时原样返回，交由 JSON 序列化环节暴露问题。
+ */
+function toHostRealm(value) {
+  if (value === null || typeof value !== 'object') return value;
+  try {
+    return structuredClone(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
  * 一次 workflow 执行的共享上下文。父子 workflow 共用同一个实例，
  * 因此并发槽位、agent 计数、预算、中止信号天然是全局的。
  */
@@ -229,7 +248,7 @@ export async function runWorkflow(options) {
     workflow: meta.name,
     meta,
     status,
-    result: status === 'ok' ? (result ?? null) : null,
+    result: status === 'ok' ? toHostRealm(result ?? null) : null,
     error: error ? { name: error.name, message: error.message } : null,
     usage: ctx.usage,
     agentCount: ctx.agentCount,
