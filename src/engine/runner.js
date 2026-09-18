@@ -178,8 +178,21 @@ export async function runWorkflow(options) {
   const dir = path.join(transcriptRoot ?? path.join(cwd, '.codex', 'workflows'), runId);
   const journal = new Journal(dir);
   if (resumeFromRunId || resumeDir) {
+    if (resumeFromRunId && !/^wf_[a-zA-Z0-9_-]+$/.test(resumeFromRunId)) throw new WorkflowScriptError('非法 resumeFromRunId');
     const priorDir =
       resumeDir ?? path.join(transcriptRoot ?? path.join(cwd, '.codex', 'workflows'), resumeFromRunId);
+    const priorState = await fsp.readFile(path.join(priorDir, 'state.json'), 'utf8')
+      .then(JSON.parse).catch(err => { if (err.code === 'ENOENT') return null; throw err; });
+    if (priorState) {
+      const alive = pid => {
+        if (!Number.isInteger(pid) || pid < 1) return false;
+        try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+      };
+      if (alive(priorState.pid) || Object.values(priorState.agents ?? {}).some(a => alive(a.pid))) {
+        throw new WorkflowScriptError('原运行或其 agent 进程尚未退出，不能重放');
+      }
+      await fsp.access(path.join(priorDir, 'summary.json'));
+    }
     const { loaded } = await journal.loadPrior(priorDir);
     onEvent({ type: 'run.resume', runId, from: resumeFromRunId ?? priorDir, cachedCalls: loaded });
   }

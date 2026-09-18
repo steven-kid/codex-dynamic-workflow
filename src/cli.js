@@ -11,6 +11,7 @@ import { parseMeta } from './engine/script.js';
 import { loadAgentRegistry } from './engine/agents.js';
 import { agentDirs, listWorkflowFiles, transcriptRoot, workflowDirs } from './util/paths.js';
 import { ProgressReporter } from './util/progress.js';
+import { startBackground, status, controlRun, resumeRun, saveRun, listRuns } from './engine/managed.js';
 
 const USAGE = `cdw —— Codex Dynamic Workflow
 
@@ -22,6 +23,10 @@ const USAGE = `cdw —— Codex Dynamic Workflow
   cdw agents                       列出可用的 agentType
   cdw runs [--limit N]             列出历史 run
   cdw resume <runId> [选项]        从历史 run 恢复（需配合 --script/--name）
+  cdw status <runId> [--cwd dir]   查看后台运行、阶段和 agent 状态
+  cdw pause <runId> [--cwd dir]    暂停新派发，已运行的 agent 继续完成
+  cdw cancel <runId> [--agent id]  停止整个运行或选中的 agent
+  cdw save <runId> --name <name>   保存脚本为命名 workflow（--personal 存个人目录）
   cdw validate <script.js>         只做语法与 meta 校验，不执行
   cdw mcp                          以 MCP stdio server 方式运行
 
@@ -35,6 +40,7 @@ const USAGE = `cdw —— Codex Dynamic Workflow
   --sandbox <mode>       codex 沙箱: read-only|workspace-write|danger-full-access
   --cwd <dir>            工作目录，默认当前目录
   --dry-run              不调用模型，用占位结果验证脚本控制流
+  --background           后台启动，立即返回 runId；resume 无脚本时使用存档参数
   --json                 以 JSON 输出最终结果
   --quiet                不渲染进度树
   --full-auto            给子 agent 加 --dangerously-bypass-approvals-and-sandbox
@@ -62,6 +68,18 @@ export async function main(argv) {
       return cmdRuns(parseArgs(rest));
     case 'resume':
       return cmdResume(rest[0], parseArgs(rest.slice(1)));
+    case 'status':
+    case 'pause':
+    case 'cancel':
+    case 'save': {
+      const opts = parseArgs(rest.slice(1));
+      const cwd = path.resolve(opts.cwd ?? process.cwd());
+      const value = command === 'status' ? await status(cwd, rest[0])
+        : command === 'save' ? await saveRun(cwd, rest[0], opts.name, Boolean(opts.personal))
+        : await controlRun(cwd, rest[0], command, opts.agent);
+      process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+      return;
+    }
     case 'validate':
       return cmdValidate(rest[0]);
     case 'mcp': {
@@ -87,6 +105,10 @@ export function parseArgs(argv) {
     const eq = key.indexOf('=');
     if (eq !== -1) {
       opts[key.slice(0, eq)] = key.slice(eq + 1);
+      continue;
+    }
+    if (['background', 'json', 'quiet', 'dry-run', 'full-auto', 'personal'].includes(key)) {
+      opts[key] = true;
       continue;
     }
     const next = argv[i + 1];
@@ -119,7 +141,7 @@ async function cmdRun(opts) {
   process.once('SIGINT', onSigint);
 
   try {
-    const summary = await runWorkflow({
+    const runOptions = {
       ...source,
       args,
       cwd,
@@ -145,7 +167,13 @@ async function cmdRun(opts) {
       agentDirs: agentDirs(cwd),
       resumeFromRunId: opts.resume ?? null,
       onEvent: (event) => reporter?.handle(event),
-    });
+    };
+    if (opts.background) {
+      const started = await startBackground(runOptions);
+      process.stdout.write(`${JSON.stringify(started, null, 2)}\n`);
+      return;
+    }
+    const summary = await runWorkflow(runOptions);
 
     if (opts.json) {
       process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
@@ -208,6 +236,11 @@ export function parseNumericOption(raw, name, { integer = false, min, fallback }
 
 async function cmdResume(runId, opts) {
   if (!runId) throw new Error('请提供要恢复的 runId，例如 cdw resume wf_abc123 --script ./wf.js');
+  if (!opts.script && !opts.name && !opts._.length) {
+    const result = await resumeRun(path.resolve(opts.cwd ?? process.cwd()), runId);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
   return cmdRun({ ...opts, resume: runId });
 }
 
@@ -249,33 +282,15 @@ async function cmdAgents() {
 }
 
 async function cmdRuns(opts) {
-  const root = transcriptRoot(path.resolve(opts.cwd ?? process.cwd()));
-  let entries;
-  try {
-    entries = await fsp.readdir(root, { withFileTypes: true });
-  } catch {
-    process.stdout.write(`还没有任何 run（${root} 不存在）\n`);
+  const managedRuns = await listRuns(path.resolve(opts.cwd ?? process.cwd()), Number(opts.limit ?? 20));
+  if (opts.json) {
+    process.stdout.write(`${JSON.stringify(managedRuns, null, 2)}\n`);
     return;
   }
-  const limit = Number(opts.limit ?? 20);
-  const runs = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    try {
-      const summary = JSON.parse(
-        await fsp.readFile(path.join(root, entry.name, 'summary.json'), 'utf8'),
-      );
-      runs.push(summary);
-    } catch {
-      runs.push({ runId: entry.name, status: 'incomplete', workflow: '?' });
-    }
+  for (const run of managedRuns) {
+    process.stdout.write(`${run.runId} ${run.status} ${run.workflow ?? '?'} ${run.agentCount ?? '?'} agents\n`);
   }
-  runs.sort((a, b) => String(b.runId).localeCompare(String(a.runId)));
-  for (const run of runs.slice(0, limit)) {
-    process.stdout.write(
-      `${run.runId.padEnd(20)} ${String(run.status).padEnd(16)} ${String(run.workflow).padEnd(24)} ${run.agentCount ?? '?'} agents\n`,
-    );
-  }
+  return;
 }
 
 async function cmdValidate(target) {
