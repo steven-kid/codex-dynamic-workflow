@@ -22,6 +22,7 @@ import { compileScript } from '../engine/script.js';
 import { runWorkflow } from '../engine/runner.js';
 import { agentDirs, listWorkflowFiles, transcriptRoot, workflowDirs } from '../util/paths.js';
 import { McpServer, textResult } from './protocol.js';
+import { startBackground, status, controlRun, resumeRun, saveRun, listRuns, runDirectory } from '../engine/managed.js';
 
 const SCRIPT_GUIDE = `workflow 脚本是一段 JavaScript（不是 TypeScript），必须以纯字面量 meta 开头：
 
@@ -46,7 +47,7 @@ export const meta = {
 脚本跑在独立 vm context 中，只有 JS 语言内建能力：无 fetch、无 process、无 require、无 setTimeout、不能 import 模块，I/O 交给子 agent 做。脚本的 return 值即为 workflow 结果。`;
 
 export function createServer({ cwd = process.cwd() } = {}) {
-  const server = new McpServer({ name: 'codex-dynamic-workflow', version: '0.1.2' });
+  const server = new McpServer({ name: 'codex-dynamic-workflow', version: '0.2.0' });
 
   server.registerTool({
     name: 'workflow_run',
@@ -80,6 +81,7 @@ ${SCRIPT_GUIDE}`,
           description: '子 agent 的 codex 沙箱模式，默认 workspace-write',
         },
         dryRun: { type: 'boolean', description: '不调模型，用占位结果验证控制流' },
+        background: { type: 'boolean', description: '后台执行并立即返回 runId；随后用 workflow_status/pause/resume/cancel 管理。默认 false，兼容同步调用' },
         resumeFromRunId: { type: 'string', description: '从历史 run 恢复：未变更的调用前缀直接复用缓存' },
       },
       required: ['cwd'],
@@ -90,7 +92,7 @@ ${SCRIPT_GUIDE}`,
       const workDir = input.cwd;
       const narration = [];
 
-      const summary = await runWorkflow({
+      const options = {
         signal,
         script: input.script,
         scriptPath: input.scriptPath ? path.resolve(workDir, input.scriptPath) : undefined,
@@ -114,7 +116,12 @@ ${SCRIPT_GUIDE}`,
           narration.push(line);
           sendProgress(line);
         },
-      });
+      };
+      if (input.background) {
+        const started = await startBackground(options);
+        return { content: [{ type: 'text', text: JSON.stringify(started) }], structuredContent: started };
+      }
+      const summary = await runWorkflow(options);
 
       const payload = {
         runId: summary.runId,
@@ -205,8 +212,7 @@ ${SCRIPT_GUIDE}`,
       additionalProperties: false,
     },
     handler: async (input) => {
-      const root = transcriptRoot(path.resolve(input.cwd ?? cwd));
-      const runs = await readRuns(root, input.limit ?? 20);
+      const runs = await listRuns(path.resolve(input.cwd ?? cwd), input.limit ?? 20);
       return {
         content: [{ type: 'text', text: JSON.stringify(runs, null, 2) }],
         structuredContent: { runs },
@@ -231,7 +237,7 @@ ${SCRIPT_GUIDE}`,
     },
     handler: async (input) => {
       const root = transcriptRoot(path.resolve(input.cwd ?? cwd));
-      const file = path.join(root, input.runId, 'journal.jsonl');
+      const file = path.join(runDirectory(path.resolve(input.cwd ?? cwd), input.runId, root), 'journal.jsonl');
       const raw = await fsp.readFile(file, 'utf8');
       const entries = raw
         .split('\n')
@@ -263,6 +269,35 @@ ${SCRIPT_GUIDE}`,
     },
   });
 
+  for (const action of ['status', 'pause', 'resume', 'cancel', 'save']) {
+    const descriptions = {
+      status: '查看运行状态、阶段、agent 状态和最近工具事件；完整结果见 workflow_inspect。',
+      pause: '暂停后台 workflow 的新派发；已运行的 agent 继续完成，不冻结进程。',
+      resume: '恢复暂停的后台 workflow；已停止的运行使用存档脚本和参数重新启动，并复用未变前缀。',
+      cancel: '停止整个后台 workflow，或仅停止 agentId 指定的 agent；单 agent 停止返回 null，不影响其他分支。',
+      save: '把运行中的存档脚本保存为命名 workflow；默认项目目录，拒绝覆盖已有文件或通过符号链接写入。',
+    };
+    server.registerTool({
+      name: `workflow_${action}`,
+      description: descriptions[action],
+      annotations: { readOnlyHint: action === 'status' },
+      inputSchema: {
+        type: 'object', properties: {
+          cwd: { type: 'string', description: '目标项目的绝对路径' }, runId: { type: 'string' },
+          ...(action === 'cancel' ? { agentId: { type: 'string' } } : {}),
+          ...(action === 'save' ? { name: { type: 'string' }, personal: { type: 'boolean' } } : {}),
+        }, required: ['cwd', 'runId', ...(action === 'save' ? ['name'] : [])], additionalProperties: false,
+      },
+      handler: async input => {
+        if (!path.isAbsolute(input.cwd)) throw new Error('cwd 必须是绝对路径');
+        const result = action === 'status' ? await status(input.cwd, input.runId)
+          : action === 'resume' ? await resumeRun(input.cwd, input.runId)
+          : action === 'save' ? await saveRun(input.cwd, input.runId, input.name, input.personal)
+          : await controlRun(input.cwd, input.runId, action, input.agentId);
+        return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
+      },
+    });
+  }
   return server;
 }
 
@@ -294,34 +329,6 @@ export function describeEvent(event) {
     default:
       return null;
   }
-}
-
-async function readRuns(root, limit) {
-  let entries;
-  try {
-    entries = await fsp.readdir(root, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  const runs = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    try {
-      const summary = JSON.parse(
-        await fsp.readFile(path.join(root, entry.name, 'summary.json'), 'utf8'),
-      );
-      runs.push({
-        runId: summary.runId,
-        workflow: summary.workflow,
-        status: summary.status,
-        agentCount: summary.agentCount,
-        durationMs: summary.durationMs,
-      });
-    } catch {
-      runs.push({ runId: entry.name, status: 'incomplete' });
-    }
-  }
-  return runs.sort((a, b) => String(b.runId).localeCompare(String(a.runId))).slice(0, limit);
 }
 
 function truncate(value, max = 2000) {

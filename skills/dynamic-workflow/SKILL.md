@@ -157,3 +157,16 @@ return { confirmed: results.flat().filter(Boolean).filter((f) => f.verdict?.real
 不要凭空猜测。
 
 预算是停止派发阈值，已运行请求可能超额；模拟运行不复用到真实运行，worktree 调用从该位置开始重跑。
+
+
+## 后台运行管理
+
+用户需要长时间执行并继续会话时，使用 `workflow_run({ cwd, scriptPath, background: true })`，记录返回的 runId。
+随后使用 `workflow_status({ cwd, runId })` 查看阶段、agent 状态、最近事件和用量；完整返回值用 workflow_inspect。
+
+- `workflow_pause({ cwd, runId })` 停止新派发，正在执行的调用继续完成。
+- `workflow_resume({ cwd, runId })` 原地恢复暂停的运行；已停止的后台运行使用存档参数启动新 run，保留最长未变前缀语义。记录返回的新 runId。
+- `workflow_cancel({ cwd, runId, agentId })` 停止选中的 agent，使其返回 null；省略 agentId 停止整个运行。
+- `workflow_save({ cwd, runId, name, personal? })` 保存为命名脚本，拒绝覆盖。
+
+后台任务在 MCP 断开后继续。只有确认 run 的终态后才能报告完成。原进程未退出、缺少最终 summary 或已发起恢复时，不能重复重放；遇到 interrupted 先检查现存进程和写入结果。暂停不冻结模型调用，不保证外部写操作 exactly-once。

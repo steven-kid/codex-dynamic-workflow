@@ -83,7 +83,7 @@ test('initialize 握手返回 serverInfo 与 capabilities', async () => {
   }
 });
 
-test('tools/list 暴露全部五个工具且 schema 合法', async () => {
+test('tools/list 暴露全部十个工具且 schema 合法', async () => {
   const dir = await fsp.mkdtemp(path.join(workDir, 'list-'));
   const server = startServer(dir);
   try {
@@ -91,10 +91,15 @@ test('tools/list 暴露全部五个工具且 schema 合法', async () => {
     const res = await server.request('tools/list', {});
     const names = res.result.tools.map((t) => t.name).sort();
     assert.deepEqual(names, [
+      'workflow_cancel',
       'workflow_inspect',
       'workflow_list',
+      'workflow_pause',
+      'workflow_resume',
       'workflow_run',
       'workflow_runs',
+      'workflow_save',
+      'workflow_status',
       'workflow_validate',
     ]);
     for (const tool of res.result.tools) {
@@ -281,4 +286,46 @@ test('进度含递增 progress，支持 token=0；取消会终止 workflow', asy
     assert.equal(runs.result.structuredContent.runs[0].status, 'failed');
     assert.ok(runs.result.structuredContent.runs[0].agentCount <= 1);
   } finally { server.stop(); }
+});
+
+test('后台 MCP 断开后可重连：状态、暂停、单 agent 取消、恢复及保存', { timeout: 15000 }, async () => {
+  const dir = await fsp.mkdtemp(path.join(workDir, 'background-'));
+  let server = startServer(dir);
+  let runId;
+  const call = async (name, extra = {}) => {
+    const response = await server.request('tools/call', { name, arguments: { cwd: dir, runId, ...extra } });
+    assert.notEqual(response.result.isError, true, JSON.stringify(response.result));
+    return response.result.structuredContent;
+  };
+  try {
+    const res = await server.request('tools/call', { name: 'workflow_run', arguments: {
+      cwd: dir, background: true, concurrency: 1,
+      script: `export const meta = {name:'mcp-background',description:'test'}; return await parallel(Array.from({length:30},(_,i)=>()=>agent('task '+i)));`,
+    }});
+    assert.notEqual(res.result.isError, true, JSON.stringify(res.result));
+    runId = res.result.structuredContent.runId;
+    server.stop();
+    server = startServer(dir);
+    await call('workflow_pause');
+    const paused = await call('workflow_status');
+    assert.equal(paused.status, 'paused');
+    const queued = Object.values(paused.agents).find(a => a.status === 'queued');
+    assert.ok(queued);
+    await call('workflow_cancel', { agentId: queued.agentId });
+    const saved = await call('workflow_save', { name: 'mcp-saved' });
+    assert.ok(saved.scriptPath.endsWith('mcp-saved.js'));
+    await call('workflow_resume');
+    await call('workflow_cancel');
+    let final;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      final = await call('workflow_status');
+      if (final.journalFile) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.equal(final.status, 'failed');
+    assert.ok(final.journalFile);
+  } finally {
+    if (runId) await call('workflow_cancel').catch(() => {});
+    server.stop();
+  }
 });

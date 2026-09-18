@@ -25,7 +25,7 @@ codex mcp list
 
 | 组件 | 作用 |
 | --- | --- |
-| MCP server `dynamic-workflow` | 向主 agent 暴露 `workflow_run` 等 5 个工具 |
+| MCP server `dynamic-workflow` | 向主 agent 暴露 `workflow_run` 等 10 个工具 |
 | skill `dynamic-workflow` | 教主 agent 何时该开 workflow、怎么写脚本 |
 | 5 个内置 workflow + 4 个 agentType | 开箱即用的编排模板 |
 
@@ -381,6 +381,29 @@ node bin/cdw.js run ./wf.js --resume wf_abc123
 
 **正因如此，脚本里禁用了 `Date.now()`、`new Date()`（无参）、`Math.random()`** —— 它们会让同一段脚本每次产生不同的 prompt，缓存永远失效。需要时间戳就通过 `args` 传进来；需要制造差异就用 `index` 或 label。
 
+### 后台运行与控制（0.2.0）
+
+```bash
+node bin/cdw.js run ./wf.js --cwd /absolute/project --background --json
+node bin/cdw.js status wf_ID --cwd /absolute/project
+node bin/cdw.js pause wf_ID --cwd /absolute/project
+node bin/cdw.js resume wf_ID --cwd /absolute/project
+node bin/cdw.js cancel wf_ID --agent wf_ID-a1 --cwd /absolute/project
+node bin/cdw.js cancel wf_ID --cwd /absolute/project
+node bin/cdw.js save wf_ID --name reusable-review --cwd /absolute/project
+```
+
+这些运行管理功能对应 [Claude Code 官方的后台运行、暂停恢复、停止单个 agent、保存工作流](https://code.claude.com/docs/en/workflows#watch-the-run)，通过 CLI/MCP 提供操作入口。
+
+- **后台运行**：一个独立 Node 进程拥有 run，关闭发起它的 CLI 或 MCP 连接后继续执行。`status` 返回阶段、agent ID、状态、最近工具事件和 token 用量；完整结果仍在 journal 中。
+- **暂停**：停止新的派发与重试，已启动的模型调用继续结束；不对进程做冻结。如果所有工作已结束，run 可以正常完成。`resume` 在同一个进程中继续暂停的运行，不重放已完成步骤。
+- **单 agent 停止**：可停止运行中或排队中的 agent。调用返回 `null`，pipeline 跳过对应条目的后续阶段；其他分支继续。停止记录视为失败，后续重放从该位置开始失效。
+- **整体停止与恢复**：停止所有进程并等待退出，再保存最终 summary（保持兼容，取消的 status 为 `failed`，error 表示中止）。无脚本参数的 `resume` 使用存档脚本、args、模型等配置启动新 run，沿用最长未变前缀规则。原进程未退出时拒绝重放；同一后台 run 的自动重放只允许发起一次，新 ID 保存在 `relaunch.json`，后续管理新 ID。
+- **异常退出**：worker 被强制杀死时，状态查询会显示 `interrupted`。缺少最终 summary 的运行不会自动重放；必须先检查原 agent 是否仍在运行、确认写操作结果，再显式开始新的运行。状态文件记录的 PID 用于保守检查，不能据此盲目终止未知进程。
+- **保存**：默认写入项目 `.codex/workflows/<name>.js`；`--personal` 写入 `$CODEX_HOME/workflows`。改写 meta.name，保留脚本体；拒绝覆盖文件或经由 `.codex`／workflows 目录符号链接写入。
+
+后台目录还包含 `config.json`（脚本参数）、`state.json`（实时状态）、`worker.log`。控制使用权限受限的本机 Unix socket；当前后台管理支持 macOS/Linux。原有同步运行入口不变。未移植 HTML 报告，也未实现 Claude 的单 agent 原地重启、云端恢复或订阅额度重置等待。
+
 ### 排查「为什么结果是空的」
 
 **先看 journal，别猜。**
@@ -404,7 +427,7 @@ journal 逐条记录了每个 agent 的真实返回值、耗时、重试次数�
 
 ## 九、MCP 工具
 
-插件向 Codex 主 agent 暴露 5 个工具：
+插件向 Codex 主 agent 暴露 10 个工具：
 
 | 工具 | 用途 |
 | --- | --- |
@@ -413,10 +436,15 @@ journal 逐条记录了每个 agent 的真实返回值、耗时、重试次数�
 | `workflow_validate` | 只校验 meta 与语法，不执行（写完先跑这个，便宜得多） |
 | `workflow_runs` | 列出历史 run，找可 resume 的 runId |
 | `workflow_inspect` | 读某次 run 的 journal，看每个 agent 的真实返回值 |
+| `workflow_status` | 查询后台运行、阶段、agent 状态、最近工具事件与用量 |
+| `workflow_pause` | 暂停新派发，允许运行中的调用完成 |
+| `workflow_resume` | 原地继续暂停的运行；使用存档参数重放已停止的运行 |
+| `workflow_cancel` | 停止整个运行，或传 `agentId` 停止单个 agent |
+| `workflow_save` | 保存存档脚本为项目／个人命名 workflow，拒绝覆盖 |
 
 `workflow_run` 必须显式传入目标项目的绝对路径 `cwd`。MCP 进程从插件目录启动，不能用其工作目录推断用户项目。
 
-`workflow_run` 执行期间会通过 MCP 进度通知实时汇报阶段与 agent 状态。
+`workflow_run` 默认保持同步返回并发送 MCP 进度通知。设置 `background: true` 时立即返回 `runId`，后台运行不依赖 MCP 连接存续；之后使用 `workflow_status` 查询状态。
 
 ---
 
@@ -430,6 +458,10 @@ cdw show <name>                  查看某个 workflow 的 meta
 cdw agents                       列出可用 agentType
 cdw runs [--limit N]             列出历史 run
 cdw resume <runId> [选项]        从历史 run 恢复
+cdw status <runId>               查看后台运行与 agent 状态
+cdw pause <runId>                暂停新派发
+cdw cancel <runId> [--agent id]  取消整个运行或单 agent
+cdw save <runId> --name <name>   保存为命名 workflow，可加 --personal
 cdw validate <script.js>         只校验，不执行
 cdw mcp                          以 MCP stdio server 运行
 ```
@@ -442,6 +474,7 @@ cdw mcp                          以 MCP stdio server 运行
 | `--model` / `--effort` / `--sandbox` | run 级默认值，可被 agent opts 覆盖 |
 | `--cwd <dir>` | 工作目录 |
 | `--dry-run` | 不调模型，用占位结果验证控制流 |
+| `--background` | 后台启动并立即返回 runId |
 | `--json` | 输出完整 summary |
 | `--quiet` | 不渲染进度树 |
 | `--full-auto` | 给子 agent 加 `--dangerously-bypass-approvals-and-sandbox` |
@@ -556,7 +589,7 @@ MCP 使用同名 `modelMap` 对象。映射目标请选账户可用的 Codex 模
 
 `.claude/agents` 支持 YAML frontmatter、正文提示、`name/description/model/effort`。Claude 特有的 `tools/disallowedTools/permissionMode/hooks/mcpServers/skills/memory/background/maxTurns/isolation` 尚不能等价迁移，选中这类 agent 会明确报错，需要在优先级更高的 `.codex/agents` 提供适配定义。Claude 宿主提供的内建 agent 类型和插件命名空间也不会自动出现。`isolation: 'worktree'` 使用本插件独立 worktree；`sandbox/worktreeKey/cwd/timeoutMs` 是 Codex 扩展。
 
-其余边界：MCP 同步返回结果，没有 Claude 的 `/workflows` 后台任务 UI；resume 使用本插件 journal；全局取消终止 run。VM 只供可信脚本，动态 import 被保守拒绝（包括字符串/注释里的 import 调用文本）。
+其余边界：提供 CLI/MCP 后台运行管理，没有 Claude 原生 `/workflows` 交互面板；resume 使用本插件 journal；全局取消终止 run。VM 只供可信脚本，动态 import 被保守拒绝（包括字符串/注释里的 import 调用文本）。
 
 开发时运行 `npm ci && npm run build:vendor` 可重建打包的 JSON Schema/YAML/meta 解析器；安装插件不需要 npm install。第三方版本、许可证随 `src/vendor` 一起分发。
 
@@ -564,4 +597,10 @@ MCP 使用同名 `modelMap` 对象。映射目标请选账户可用的 Codex 模
 
 ```sh
 node scripts/smoke-compat-real.mjs /absolute/installed-plugin-root /absolute/output-dir
+```
+
+后台运行管理的真实模型验收（调用 2 个只读 agent，检查暂停期间第二个不启动、恢复与保存）：
+
+```sh
+node scripts/smoke-managed-real.mjs /absolute/installed-plugin-root /absolute/output-dir
 ```
