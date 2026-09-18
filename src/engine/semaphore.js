@@ -29,19 +29,29 @@ export class Semaphore {
   }
 
   /** 获取一个槽位，返回释放函数 */
-  async acquire() {
+  async acquire(signal) {
+    if (signal?.aborted) throw signal.reason;
     if (this.#active < this.#limit) {
       this.#active += 1;
       return () => this.#release();
     }
-    await new Promise((resolve) => this.#queue.push(resolve));
-    this.#active += 1;
+    await new Promise((resolve, reject) => {
+      const entry = {
+        resolve: () => { signal?.removeEventListener('abort', abort); resolve(); },
+      };
+      const abort = () => {
+        this.#queue.splice(this.#queue.indexOf(entry), 1);
+        reject(signal.reason);
+      };
+      this.#queue.push(entry);
+      signal?.addEventListener('abort', abort, { once: true });
+    });
     return () => this.#release();
   }
 
   /** 包裹一次异步调用，保证异常路径也会释放槽位 */
-  async run(fn) {
-    const release = await this.acquire();
+  async run(fn, signal) {
+    const release = await this.acquire(signal);
     try {
       return await fn();
     } finally {
@@ -50,8 +60,8 @@ export class Semaphore {
   }
 
   #release() {
-    this.#active -= 1;
     const next = this.#queue.shift();
-    if (next) next();
+    if (next) next.resolve(); // Transfer the reserved slot before another acquire.
+    else this.#active -= 1;
   }
 }

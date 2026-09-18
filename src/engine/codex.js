@@ -211,6 +211,7 @@ export async function runCodexExec({
       : null;
 
     child.stdin.on('error', () => {});
+    onEvent({ type: 'process.started', pid: child.pid });
     child.stdin.end(prompt);
 
     const stdoutLines = createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -232,6 +233,7 @@ export async function runCodexExec({
     try {
       [exitCode] = await once(child, 'close');
     } finally {
+      onEvent({ type: 'process.exited', pid: child.pid });
       if (timer) clearTimeout(timer);
       if (killTimer) { clearTimeout(killTimer); kill('SIGKILL'); }
       if (signal) signal.removeEventListener('abort', abortHandler);

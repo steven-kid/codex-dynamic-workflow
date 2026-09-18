@@ -39,6 +39,7 @@ import { Semaphore } from './semaphore.js';
 import { compileScript } from './script.js';
 import { listWorkflowFiles, workflowDirs as defaultWorkflowDirs, agentDirs as defaultAgentDirs } from '../util/paths.js';
 import { createWorktree, isGitRepo } from './worktree.js';
+import { RunControl } from './control.js';
 
 /** run id 生成：脚本里禁用了 Date.now/Math.random，但引擎自身可以用 */
 function makeRunId() {
@@ -101,6 +102,7 @@ class RunContext {
     this.journal = options.journal;
     this.semaphore = options.semaphore;
     this.signal = options.signal;
+    this.control = options.control;
     this.emit = options.emit;
     this.transcriptDir = options.transcriptDir;
     this.resolveWorkflow = options.resolveWorkflow;
@@ -171,7 +173,8 @@ export async function runWorkflow(options) {
   const source = await resolveSource({ script, scriptPath, workflowName: workflowName ?? options.name, workflowDirs, cwd });
   const { meta, run } = compileScript(source.text, { filename: source.filename });
 
-  const runId = makeRunId();
+  const runId = options.runId ?? makeRunId();
+  if (!/^wf_[a-zA-Z0-9_-]+$/.test(runId)) throw new WorkflowScriptError('非法 runId');
   const dir = path.join(transcriptRoot ?? path.join(cwd, '.codex', 'workflows'), runId);
   const journal = new Journal(dir);
   if (resumeFromRunId || resumeDir) {
@@ -195,8 +198,11 @@ export async function runWorkflow(options) {
   };
 
   const controller = new AbortController();
+  const control = options.control ?? new RunControl();
   const abort = () => controller.abort();
   if (signal?.aborted) abort();
+  if (control.signal.aborted) abort();
+  control.signal.addEventListener('abort', abort, { once: true });
   signal?.addEventListener('abort', abort, { once: true });
 
   const ctx = new RunContext({
@@ -207,6 +213,7 @@ export async function runWorkflow(options) {
     journal,
     semaphore: new Semaphore(concurrency),
     signal: controller.signal,
+    control,
     emit,
     transcriptDir: dir,
     budgetTotal: budget,
@@ -240,6 +247,7 @@ export async function runWorkflow(options) {
     controller.abort();
     await Promise.allSettled([...ctx.pendingAgents]);
     signal?.removeEventListener('abort', abort);
+    control.signal.removeEventListener('abort', abort);
   }
   if (status === 'ok' && budget !== null && (ctx.spentOutputTokens > budget || ctx.budgetBlocked)) {
     status = 'budget_exhausted';
@@ -399,11 +407,19 @@ async function runAgent(ctx, prompt, opts) {
     return cached.result;
   }
 
-  return ctx.semaphore.run(async () => {
+  const agentId = `${ctx.runId}-a${seq}`;
+  const local = new AbortController();
+  const abort = () => local.abort();
+  ctx.signal.addEventListener('abort', abort, { once: true });
+  if (ctx.signal.aborted) abort();
+  ctx.control.agents.set(agentId, local);
+  ctx.emit({ type: 'agent.queued', seq, agentId, label, phase: resolved.phase, prompt });
+  try {
+  return await ctx.semaphore.run(async () => {
+    await ctx.control.wait(local.signal);
     ctx.assertRunnable();
     ctx.agentCount += 1;
 
-    const agentId = `${ctx.runId}-a${seq}`;
     let workDir = opts.cwd ?? ctx.cwd;
     let worktree = null;
 
@@ -425,6 +441,8 @@ async function runAgent(ctx, prompt, opts) {
         ctx.emit({ type: 'warning', message: `${label}: 非 git 仓库，已忽略 worktree 隔离` });
       }
     }
+
+    await ctx.control.wait(local.signal);
 
     ctx.emit({
       type: 'agent.started',
@@ -450,6 +468,7 @@ async function runAgent(ctx, prompt, opts) {
     const maxAttempts = 1 + ctx.maxRetries + (schema ? ctx.schemaRetries : 0);
 
     while (attempt < maxAttempts) {
+      await ctx.control.wait(local.signal);
       attempt += 1;
       ctx.assertRunnable({ checkLimit: false });
 
@@ -474,7 +493,7 @@ async function runAgent(ctx, prompt, opts) {
               schema,
               fullAuto: ctx.fullAuto,
               timeoutMs: opts.timeoutMs ?? ctx.agentTimeoutMs,
-              signal: ctx.signal,
+              signal: local.signal,
               onEvent: (event) =>
                 ctx.emit({ type: 'agent.event', seq, agentId, label, event }),
             });
@@ -559,7 +578,18 @@ async function runAgent(ctx, prompt, opts) {
     });
     ctx.emit({ type: 'agent.failed', seq, agentId, label, message: failure.message });
     return null;
-  });
+  }, local.signal);
+  } catch (err) {
+    if (ctx.signal.aborted) throw new WorkflowAbortError('run 已中止');
+    if (!local.signal.aborted) throw err;
+    ctx.journal.append({ kind: 'agent', seq, agentId, label, phase: resolved.phase,
+      fingerprint: fp, status: 'failed', error: 'agent 已由用户停止', result: null });
+    ctx.emit({ type: 'agent.cancelled', seq, agentId, label, phase: resolved.phase });
+    return null;
+  } finally {
+    ctx.control.agents.delete(agentId);
+    ctx.signal.removeEventListener('abort', abort);
+  }
 }
 
 /** dry-run：不调模型，产出占位结果，用来验证脚本控制流 */

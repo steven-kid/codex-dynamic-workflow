@@ -28,12 +28,12 @@ const chunks = [];
 process.stdin.on('data', (c) => chunks.push(c));
 process.stdin.on('end', async () => {
   const prompt = Buffer.concat(chunks).toString('utf8');
-  if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
 
   const emit = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
 
   emit({ type: 'thread.started', thread_id: `th_${process.pid}` });
   emit({ type: 'turn.started' });
+  if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
 
   if (mode === 'crash') {
     emit({ type: 'error', message: '模拟的执行失败' });
