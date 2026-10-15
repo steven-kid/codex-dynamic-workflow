@@ -4,6 +4,10 @@
 
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { constants } from 'node:fs';
+import { PLUGIN_ROOT } from './util/paths.js';
 
 import { runWorkflow, resolveSource } from './engine/runner.js';
 import { defaultConcurrency } from './engine/constants.js';
@@ -28,6 +32,9 @@ const USAGE = `cdw —— Codex Dynamic Workflow
   cdw cancel <runId> [--agent id]  停止整个运行或选中的 agent
   cdw save <runId> --name <name>   保存脚本为命名 workflow（--personal 存个人目录）
   cdw validate <script.js>         只做语法与 meta 校验，不执行
+  cdw init [file.js]               生成只读 workflow 示例，不覆盖已有文件
+  cdw doctor [--json] [--cwd dir]  检查 Node、Codex CLI 和目标目录
+  cdw --version                   显示版本
   cdw mcp                          以 MCP stdio server 方式运行
 
 选项:
@@ -56,6 +63,14 @@ export async function main(argv) {
     case 'help':
       process.stdout.write(USAGE);
       return;
+    case '--version':
+    case '-v':
+      process.stdout.write(JSON.parse(await fsp.readFile(path.join(PLUGIN_ROOT, 'package.json'), 'utf8')).version + '\n');
+      return;
+    case 'init':
+      return cmdInit(parseArgs(rest));
+    case 'doctor':
+      return cmdDoctor(parseArgs(rest));
     case 'run':
       return cmdRun(parseArgs(rest));
     case 'list':
@@ -330,4 +345,49 @@ async function readStdin() {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
   return Buffer.concat(chunks).toString('utf8');
+}
+
+
+async function cmdInit(opts) {
+  const cwd = path.resolve(opts.cwd ?? process.cwd());
+  const target = path.resolve(cwd, opts._[0] ?? 'workflow.js');
+  const source = `export const meta = {
+  name: 'first-workflow',
+  description: 'Read-only repository overview',
+};
+
+phase('Explore');
+const results = await parallel([
+  () => agent('Read the README and summarize the project. Do not modify files.',
+    { label: 'overview', sandbox: 'read-only' }),
+  () => agent('Identify the documented test commands. Do not run them or modify files.',
+    { label: 'tests', sandbox: 'read-only' }),
+]);
+return { results, incomplete: results.filter(value => value === null).length };
+`;
+  // Atomic exclusive creation: never truncate an existing file or follow its symlink.
+  await fsp.writeFile(target, source, { encoding: 'utf8', flag: 'wx' });
+  process.stdout.write(`Created ${target}\nNext: cdw validate ${JSON.stringify(target)}\n`);
+}
+
+async function cmdDoctor(opts) {
+  const cwd = path.resolve(opts.cwd ?? process.cwd());
+  const checks = [{ name: 'node', ok: Number(process.versions.node.split('.')[0]) >= 20, detail: process.version }];
+  try {
+    const { stdout } = await promisify(execFile)(process.env.CDW_CODEX_BIN || 'codex', ['--version'], { timeout: 5000 });
+    checks.push({ name: 'codex', ok: true, detail: stdout.trim() });
+  } catch {
+    checks.push({ name: 'codex', ok: false, detail: 'Codex CLI unavailable; install it and check PATH or CDW_CODEX_BIN.' });
+  }
+  try {
+    const stat = await fsp.stat(cwd);
+    if (!stat.isDirectory()) throw new Error('Not a directory');
+    await fsp.access(cwd, constants.R_OK | constants.W_OK);
+    checks.push({ name: 'cwd', ok: true, detail: cwd });
+  } catch {
+    checks.push({ name: 'cwd', ok: false, detail: 'Target directory must exist and be readable/writable.' });
+  }
+  const result = { ok: checks.every(check => check.ok), checks, note: 'Checks availability only; model access and authentication are not verified.' };
+  process.stdout.write(opts.json ? JSON.stringify(result, null, 2) + '\n' : checks.map(check => `${check.ok ? 'OK' : 'FAIL'} ${check.name}: ${check.detail}`).join('\n') + '\n' + result.note + '\n');
+  if (!result.ok) process.exitCode = 1;
 }

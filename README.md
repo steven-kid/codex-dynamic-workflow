@@ -10,7 +10,41 @@
 
 ## 一、快速开始
 
-### 1.1 安装
+### 1.1 npm CLI（推荐）
+
+需要 Node.js ≥ 20，以及已安装、已完成登录的 Codex CLI。
+
+```bash
+npm install -g codex-dynamic-workflow
+cdw --version
+cdw doctor
+
+# 在目标项目目录创建示例，再校验和执行
+cdw init
+cdw validate ./workflow.js
+cdw run ./workflow.js --concurrency 2 --budget 20000
+```
+
+临时使用，无需全局安装：
+
+```bash
+npx codex-dynamic-workflow list
+npx codex-dynamic-workflow run --name review-changes
+```
+
+CI 或团队项目可以安装为 devDependency，并通过 lockfile 固定版本：
+
+```bash
+npm install --save-dev codex-dynamic-workflow
+npx cdw validate ./workflow.js
+```
+
+`cdw init [file.js]` 默认生成 `workflow.js`，拒绝覆盖已有文件。`cdw doctor --json` 检查 Node、Codex CLI 和目标目录，不调用模型，也不代表已经验证模型权限或登录状态。
+
+### Codex 插件入口（可选）
+
+npm 安装提供 CLI，不会自动注册 Codex 插件。需要会话内的 Skill 与 MCP 工具时，可保留原插件安装方式，CLI 与插件共用同一执行引擎。
+
 
 ```bash
 # 注册本地 marketplace 并安装
@@ -44,8 +78,8 @@ codex mcp list
 **方式二：命令行直接跑**
 
 ```bash
-node bin/cdw.js run --name review-changes
-node bin/cdw.js run ./my-workflow.js --args '{"target":"src/"}' --budget 500000
+cdw run --name review-changes
+cdw run ./my-workflow.js --args '{"target":"src/"}' --budget 500000
 ```
 
 ### 1.3 第一个脚本
@@ -66,8 +100,8 @@ return results
 ```
 
 ```bash
-node bin/cdw.js validate ./hello.js   # 先校验（不花钱）
-node bin/cdw.js run ./hello.js        # 再执行
+cdw validate ./hello.js   # 先校验（不花钱）
+cdw run ./hello.js        # 再执行
 ```
 
 ---
@@ -160,8 +194,8 @@ const target = (args && args.target) || 'src/'
 ```
 
 ```bash
-node bin/cdw.js run wf.js --args '{"target":"src/api"}'
-node bin/cdw.js run wf.js --args @params.json
+cdw run wf.js --args '{"target":"src/api"}'
+cdw run wf.js --args @params.json
 ```
 
 ### `budget`
@@ -266,7 +300,7 @@ sandbox: read-only
 对每个发现，必须给出可复现的攻击路径，给不出的不要报。
 ```
 
-正文会作为额外的 system prompt 追加给该 agent。查看当前可用的：`node bin/cdw.js agents`。
+正文会作为额外的 system prompt 追加给该 agent。查看当前可用的：`cdw agents`。
 
 ---
 
@@ -293,9 +327,9 @@ sandbox: read-only
 ## 六、内置 workflow
 
 ```bash
-node bin/cdw.js list                                   # 列出全部
-node bin/cdw.js show review-changes                    # 看某个的 meta
-node bin/cdw.js run --name hunt-bugs --args '{"target":"src/"}'
+cdw list                                   # 列出全部
+cdw show review-changes                    # 看某个的 meta
+cdw run --name hunt-bugs --args '{"target":"src/"}'
 ```
 
 | 名称 | 做什么 | 编排形态 |
@@ -363,9 +397,9 @@ const survives = votes.filter(Boolean).filter((v) => !v.refuted).length >= 2
 每次 run 都会把脚本存档到 `<项目根>/.codex/workflow-runs/<runId>/`，并返回 `runId`。
 
 ```bash
-node bin/cdw.js run ./wf.js                   # 第一次跑，记下 runId
+cdw run ./wf.js                   # 第一次跑，记下 runId
 # ...改脚本...
-node bin/cdw.js run ./wf.js --resume wf_abc123
+cdw run ./wf.js --resume wf_abc123
 ```
 
 **语义是「最长未变前缀」**：从头开始逐个比对每次 `agent()` 调用的指纹（prompt + 影响执行的 opts），一路命中缓存直到遇到第一个改动过的调用，从那里开始全部重跑。
@@ -384,13 +418,13 @@ node bin/cdw.js run ./wf.js --resume wf_abc123
 ### 后台运行与控制（0.2.0）
 
 ```bash
-node bin/cdw.js run ./wf.js --cwd /absolute/project --background --json
-node bin/cdw.js status wf_ID --cwd /absolute/project
-node bin/cdw.js pause wf_ID --cwd /absolute/project
-node bin/cdw.js resume wf_ID --cwd /absolute/project
-node bin/cdw.js cancel wf_ID --agent wf_ID-a1 --cwd /absolute/project
-node bin/cdw.js cancel wf_ID --cwd /absolute/project
-node bin/cdw.js save wf_ID --name reusable-review --cwd /absolute/project
+cdw run ./wf.js --cwd /absolute/project --background --json
+cdw status wf_ID --cwd /absolute/project
+cdw pause wf_ID --cwd /absolute/project
+cdw resume wf_ID --cwd /absolute/project
+cdw cancel wf_ID --agent wf_ID-a1 --cwd /absolute/project
+cdw cancel wf_ID --cwd /absolute/project
+cdw save wf_ID --name reusable-review --cwd /absolute/project
 ```
 
 这些运行管理功能对应 [Claude Code 官方的后台运行、暂停恢复、停止单个 agent、保存工作流](https://code.claude.com/docs/en/workflows#watch-the-run)，通过 CLI/MCP 提供操作入口。
@@ -409,7 +443,7 @@ node bin/cdw.js save wf_ID --name reusable-review --cwd /absolute/project
 **先看 journal，别猜。**
 
 ```bash
-node bin/cdw.js runs                    # 找到 runId
+cdw runs                    # 找到 runId
 cat .codex/workflow-runs/<runId>/journal.jsonl
 ```
 

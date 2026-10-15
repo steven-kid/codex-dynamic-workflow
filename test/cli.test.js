@@ -216,3 +216,32 @@ return await agent('不应执行到这里')
   assert.equal(summary.agentCount, 0);
   assert.deepEqual(summary.result, { sites: [], results: [] });
 });
+
+test('init produces valid workflow and refuses overwrite', async () => {
+  const dir = await fsp.mkdtemp(path.join(workDir, 'init-'));
+  await cdw(['init'], { cwd: dir });
+  const file = path.join(dir, 'workflow.js');
+  const original = await fsp.readFile(file, 'utf8');
+  await cdw(['validate', file]);
+  await assert.rejects(cdw(['init'], { cwd: dir }));
+  assert.equal(await fsp.readFile(file, 'utf8'), original);
+});
+
+test('doctor reports missing CLI without model execution', async () => {
+  try {
+    await exec(process.execPath, [CLI, 'doctor', '--json'], {
+      cwd: workDir, env: { ...process.env, CDW_CODEX_BIN: path.join(workDir, 'missing-codex') },
+    });
+    assert.fail('must exit unsuccessfully');
+  } catch (err) {
+    const result = JSON.parse(err.stdout);
+    assert.equal(result.ok, false);
+    assert.equal(result.checks.find(x => x.name === 'codex').ok, false);
+    assert.match(result.note, /authentication are not verified/);
+  }
+});
+
+test('version matches package metadata', async () => {
+  const pkg = JSON.parse(await fsp.readFile(path.join(ROOT, 'package.json'), 'utf8'));
+  assert.equal((await cdw(['--version'])).stdout.trim(), pkg.version);
+});

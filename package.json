@@ -1,6 +1,6 @@
 {
   "name": "codex-dynamic-workflow",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Dynamic Workflow for Codex CLI: deterministic multi-agent orchestration with agent/parallel/pipeline/phase/budget/resume",
   "type": "module",
   "bin": {
@@ -25,15 +25,28 @@
     "agents",
     "skills",
     ".codex-plugin",
-    ".mcp.json"
+    ".mcp.json",
+    ".agents/plugins/marketplace.json",
+    "LICENSE"
   ],
   "license": "MIT",
-  "private": true,
   "devDependencies": {
     "ajv": "8.17.1",
     "ajv-formats": "3.0.1",
     "esbuild": "0.25.10",
     "json5": "2.2.3",
     "yaml": "2.8.1"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/steven-kid/codex-dynamic-workflow.git"
+  },
+  "homepage": "https://github.com/steven-kid/codex-dynamic-workflow#readme",
+  "bugs": {
+    "url": "https://github.com/steven-kid/codex-dynamic-workflow/issues"
   }
 }
